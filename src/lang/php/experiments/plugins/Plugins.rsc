@@ -11,9 +11,11 @@ import Relation;
 import List;
 import IO;
 import ValueIO;
+import util::Maybe;
+import String;
 
-private loc pluginDir = |file:///Users/hillsma/PHPAnalysis/plugins|;
-private loc pluginBin = |file:///Users/hillsma/PHPAnalysis/serialized/plugins|;
+private loc pluginDir = |file:///Users/mhills/PHPAnalysis/plugins|;
+private loc pluginBin = |file:///Users/mhills/PHPAnalysis/serialized/plugins|;
 
 public void buildPluginBinary(str s, loc l) {
 	logMessage("Parsing <s>. \>\> Location: <l>.", 1);
@@ -35,8 +37,16 @@ public void buildPluginBinaries() {
 	}
 }
 
+public loc getPluginSrcLoc(str s) {
+	return pluginDir + s;
+}
+
+public loc getPluginBinLoc(str s) {
+	return pluginBin + "<s>.pt";
+}
+
 public System loadPluginBinary(str s) {
-	loc binLoc = pluginBin + "<s>.pt";
+	loc binLoc = getPluginBinLoc(s);
 	if (exists(binLoc)) {
 		return readBinaryValueFile(#System, binLoc);
 	} else {
@@ -44,4 +54,19 @@ public System loadPluginBinary(str s) {
 	}
 }
 
-//public void readPluginInfo
+data PluginInfo = noInfo() | pluginInfo(Maybe[str] pluginName, Maybe[str] testedUpTo, Maybe[str] stableTag, Maybe[str] requiresAtLeast);
+
+public PluginInfo readPluginInfo(str s) {
+	loc srcLoc = getPluginSrcLoc(s);
+	if (exists(srcLoc+"readme.txt")) {
+		fileContents = readFile(srcLoc+"readme.txt");
+		pluginName = (/===<v:.*>===\n/i := fileContents) ? just(trim(v)) : nothing();
+		testedUpTo = (/Tested up to: <v:.*>\n/i := fileContents) ? just(trim(v)) : nothing();
+		stableTag = (/Stable tag: <v:.*>\n/i := fileContents) ? just(trim(v)) : nothing(); 
+		requiresAtLeast = (/Requires at least: <v:.*>\n/i := fileContents) ? just(trim(v)) : nothing(); 
+		return pluginInfo(pluginName, testedUpTo, stableTag, requiresAtLeast);
+	} else {
+		println("readme.txt not found for plugin <s>");
+		return noInfo();
+	}
+}
