@@ -1,0 +1,9 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: Plugins
+Bundle-SymbolicName: Plugins
+Bundle-Version: 1.0.0
+Require-Bundle: org.eclipse.imp.pdb.values,
+ rascal,
+ PHPAnalysis
+Bundle-RequiredExecutionEnvironment: JavaSE-1.6
