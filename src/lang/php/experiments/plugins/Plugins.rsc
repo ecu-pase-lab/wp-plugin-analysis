@@ -218,6 +218,11 @@ HRel definedActions(System s) {
     return res;
 }
 
+@doc{Extract a relational summary of the given plugin, passed as a System}
+public PluginSummary extractPluginSummary(System pt) {
+	return summary(noInfo(), definedFunctions(pt), definedMethods(pt), definedFilters(pt), definedActions(pt), definedConstants(pt), definedClassConstants(pt), definedShortcodes(pt), definedOptions(pt), definedPostMetaKeys(pt), definedUserMetaKeys(pt), definedCommentMetaKeys(pt));
+}
+
 @doc{Extract a relational summary of the given plugin from a pre-parsed plugin binary}
 public void extractPluginSummary(str pluginName) {
     pt = loadPluginBinary(pluginName);
@@ -654,11 +659,11 @@ set[NameOrExpr] multiplyDefinedCommentMetaKeys() {
 	return multiplyDefinedKeys(definingPluginsForMetaKeys(pluginCommentMetaKeys()));
 }
 
-data FunctionInfo = functionInfo(int totalFunctions, int conflictingFunctions, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
+data FunctionInfo = functionInfo(int totalFunctions, int inPlugins, int conflictingFunctions, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
 
-data ClassInfo = classInfo(int totalClasses, int conflictingClasses, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
+data ClassInfo = classInfo(int totalClasses, int inPlugins, int conflictingClasses, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
 
-data MethodInfo = methodInfo(int totalMethods, int conflictingMethods, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
+data MethodInfo = methodInfo(int totalMethods, int inPlugins, int conflictingMethods, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
 
 data ConstInfo = constInfo(int totalConsts, int conflictingConsts, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
 
@@ -684,6 +689,9 @@ real intListMedian(list[int] nums) {
 }
 
 FunctionInfo computeFunctionInfo(rel[str,str] functions) {
+	// Upper-case the functions, since they are actually case insensitive
+	functions = { < p, toUpperCase(f) > | < p, f > <- functions };
+	
 	// Next, compute the map for defining plugins
 	definingPlugins = definingPluginsForFunctions(functions);
 	
@@ -705,10 +713,13 @@ FunctionInfo computeFunctionInfo(rel[str,str] functions) {
 	// What is the median conflict set?
 	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
 	
-	return functionInfo(size(functions), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
+	return functionInfo(size(functions), size(functions<0>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
 }
 
 ClassInfo computeClassInfo(rel[str,str,str] methods) {
+	// Upper-case the classes and methods, since they are actually case insensitive
+	methods = { < p, toUpperCase(c), toUpperCase(m) > | < p, c, m > <- methods };
+
 	// Next, compute the map for defining plugins
 	definingPlugins = definingPluginsForClasses(methods);
 	
@@ -730,10 +741,13 @@ ClassInfo computeClassInfo(rel[str,str,str] methods) {
 	// What is the median conflict set?
 	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
 	
-	return classInfo(size(methods<0,1>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
+	return classInfo(size(methods<0,1>), size(methods<0>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
 }
 
 MethodInfo computeMethodInfo(rel[str,str,str] methods) {
+	// Upper-case the classes and methods, since they are actually case insensitive
+	methods = { < p, toUpperCase(c), toUpperCase(m) > | < p, c, m > <- methods };
+
 	// Next, compute the map for defining plugins
 	definingPlugins = definingPluginsForMethods(methods);
 	
@@ -755,7 +769,7 @@ MethodInfo computeMethodInfo(rel[str,str,str] methods) {
 	// What is the median conflict set?
 	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
 	
-	return methodInfo(size(methods), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
+	return methodInfo(size(methods), size(methods<0>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
 }
 
 ConstInfo computeConstantInfo(rel[str,str] consts) {
@@ -1134,4 +1148,80 @@ tuple[datetime s, datetime e] timeKeyConflictDetection() {
 	computeMetaKeyConflictInfo(pluginCommentMetaKeys());
 	dt2 = now();
 	return < dt1, dt2 >;
+}
+
+@doc{The conflict report, containing conflicts with a given plugin}
+data Conflicts = conflicts(PluginInfo pInfo, map[str,set[str]] functions, map[str,set[str]] classes, map[tuple[str,str],set[str]] methods, map[str,set[str]] filters, map[str,set[str]] actions, map[str,set[str]] consts, map[tuple[str,str],set[str]] classConsts, map[str,set[str]] shortcodes, map[str,set[str]] options, map[str,set[str]] postMetaKeys, map[str,set[str]] userMetaKeys, map[str,set[str]] commentMetaKeys);
+
+@doc{Find conflicts with the set of plugins in plugins.}
+Conflicts findConflicts(System sys, set[str] plugins) {
+	return findConflicts(extractPluginSummary(sys), plugins);
+}
+
+@doc{Find conflicts with the set of plugins in plugins.}
+Conflicts findConflicts(PluginSummary sysSummary, set[str] plugins) {
+	// TODO: For now, we are checking against every plugin, we need to filter this to allow
+	// for checks against user-defined subsets.
+	
+	// Get back entities defined in the plugins
+	pf = pluginFunctions();
+	pm = pluginMethods();
+	pc = pluginConstants();
+	pcc = pluginClassConstants();
+	ps = pluginShortcodes();
+	po = pluginOptions();
+	ppm = pluginPostMetaKeys();
+	pum = pluginUserMetaKeys();
+	pcm = pluginCommentMetaKeys();
+
+	// Put these info a form where we can easily map from entities to plugins that define them
+	dpf = definingPluginsForFunctions(pf);
+	dpc = definingPluginsForClasses(pm);
+	dpm = definingPluginsForMethods(pm);
+	dpconst = definingPluginsForConstants(pc);
+	dpcconst = definingPluginsForClassConstants(pcc);
+	dps = definingPluginsForShortcodes(ps);
+	dpo = definingPluginsForOptions(po);
+	dppm = definingPluginsForMetaKeys(ppm);	
+	dpum = definingPluginsForMetaKeys(pum);	
+	dpcm = definingPluginsForMetaKeys(pcm);	
+	
+	// Get back just the names of entities for the current plugin
+	wpf = { f | < f, _ > <- sysSummary.functions };
+	wpm = { < c, m > | < c, m, _ > <- sysSummary.methods };
+	wpc = wpm<0>;
+	wpconst = { c | < c, _ > <- sysSummary.consts };
+	wpcconst = { < c, x > | < c, x, _ > <- sysSummary.classConsts };
+	wpshort = { s | < s:name(name(si)), _ > <- sysSummary.shortcodes };
+	wpo = { s | < s:name(name(si)), _ > <- sysSummary.options };
+	wppm = { s | < s:name(name(si)), _ > <- sysSummary.postMetaKeys };
+	wpum = { s | < s:name(name(si)), _ > <- sysSummary.userMetaKeys };
+	wpcm = { s | < s:name(name(si)), _ > <- sysSummary.commentMetaKeys };
+	
+	// Restrict the domains of each entity map/relation to just include conflicting entities
+	conflictFunctions = domainR(dpf,wpf);
+	conflictMethods = domainR(dpm,wpm);
+	conflictClasses = domainR(dpc,wpc);
+	conflictConsts = domainR(dpconst, wpconst);
+	conflictClassConsts = domainR(dpcconst, wpcconst);
+	conflictShortcodes = domainR(dps, wpshort);
+	conflictOptions = domainR(dpo, wpo);
+	conflictPostMeta = domainR(dppm, wppm);
+	conflictUserMeta = domainR(dpum, wpum);
+	conflictCommentMeta = domainR(dpcm, wpcm);
+
+	println("CONFLICT REPORT");
+	println("Found <size(conflictFunctions)> function conflicts with <size({p|k<-conflictFunctions,p<-conflictFunctions[k]})> plugins");
+	println("Found <size(conflictMethods)> method conflicts with <size({p|k<-conflictMethods,p<-conflictMethods[k]})> plugins");
+	println("Found <size(conflictClasses)> class conflicts with <size({p|k<-conflictClasses,p<-conflictClasses[k]})> plugins");
+	println("Found <size(conflictConsts)> const conflicts with <size({p|k<-conflictConsts,p<-conflictConsts[k]})> plugins");
+	println("Found <size(conflictClassConsts)> class const conflicts with <size({p|k<-conflictClassConsts,p<-conflictClassConsts[k]})> plugins");
+	println("Found <size(conflictShortcodes)> shortcode conflicts with <size({p|k<-conflictShortcodes,p<-conflictShortcodes[k]})> plugins");
+	println("Found <size(conflictOptions)> option conflicts with <size({p|k<-conflictOptions,p<-conflictOptions[k]})> plugins");
+	println("Found <size(conflictPostMeta)> post meta conflicts with <size({p|k<-conflictPostMeta,p<-conflictPostMeta[k]})> plugins");
+	println("Found <size(conflictUserMeta)> user meta conflicts with <size({p|k<-conflictUserMeta,p<-conflictUserMeta[k]})> plugins");
+	println("Found <size(conflictCommentMeta)> comment meta conflicts with <size({p|k<-conflictCommentMeta,p<-conflictCommentMeta[k]})> plugins");
+	
+	// Return the summary of conflicts
+	return conflicts(conflictFunctions, conflictClasses, conflictMethods, conflictConsts, conflictClassConsts, conflictShortcodes, conflictOptions, conflictPostMeta, conflictUserMeta, conflictCommentMeta);
 }
