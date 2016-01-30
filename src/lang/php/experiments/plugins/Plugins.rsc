@@ -51,10 +51,19 @@ public void buildPluginBinary(str s, loc l, bool overwrite = true, set[str] skip
 public void buildPluginBinaries(bool overwrite = true, set[str] skip = { }) {
     pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
     int i = 0;
-    for (l <- pluginDirs, l.file notin skip) {
+    for (l <- pluginDirs, l.file notin skip, l.file == "wp-survey-and-poll") {
     	i += 1;
     	println("Building binary #<i> for <l.file>");
         buildPluginBinary(l.file,l,overwrite=overwrite,skip=skip);
+    }
+}
+
+public void convertPluginBinaries() {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, l.file > "wp-survey-and-poll") {
+    	println("Converting binary for <l.file>");
+    	loc binLoc = pluginBin + "<l.file>.pt";
+    	writeBinaryValueFile(binLoc, convertSystem(readBinaryValueFile(#value, binLoc)), compression=false);
     }
 }
 
@@ -126,47 +135,47 @@ data PluginSummary = summary(PluginInfo pInfo, FRel functions, MRel methods, HRe
 
 @doc{Extract the information on declared functions for the given system}
 FRel definedFunctions(System s) {
-    return { < fname, f@at > | /f:function(fname,_,_,_) := s };
+    return { < fname, f@at > | /f:function(fname,_,_,_) := s.files };
 }
 
 @doc{Extract the information on declared methods for the given system}
 MRel definedMethods(System s) {
-    return { < cname, mname, m@at > | /c:class(cname,_,_,_,members) := s, m:method(mname,mods,_,_,_) <- members, \public() in mods || !(\private() in mods || \protected() in mods) };
+    return { < cname, mname, m@at > | /c:class(cname,_,_,_,members) := s.files, m:method(mname,mods,_,_,_) <- members, \public() in mods || !(\private() in mods || \protected() in mods) };
 }
 
 @doc{Extract the information on declared constants for the given system}
 ConstRel definedConstants(System s) {
-	return { < cn, c@at > | /c:call(name(name("define")),[actualParameter(scalar(string(cn)),false),actualParameter(e,false)]) := s };
+	return { < cn, c@at > | /c:call(name(name("define")),[actualParameter(scalar(string(cn)),false),actualParameter(e,false)]) := s.files };
 }
 
 @doc{Extract the information on declared class constants for the given system}
 ClassConstRel definedClassConstants(System s) {
-	return { < cn, name, cc@at > | /class(cn,_,_,_,cis) := s, constCI(consts) <- cis, cc:const(name,ce) <- consts };
+	return { < cn, name, cc@at > | /class(cn,_,_,_,cis) := s.files, constCI(consts) <- cis, cc:const(name,ce) <- consts };
 }
 
 @doc{Extract the information on declared WordPress shortcodes for the given system}
 ShortcodeRel definedShortcodes(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_shortcode")),[actualParameter(e,_),actualParameter(cb,_)]) := s };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_shortcode")),[actualParameter(e,_),actualParameter(cb,_)]) := s.files };
 }
 
 @doc{Extract the information on declared admin options for WordPress plugins for the given system}
 OptionRel definedOptions(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_option")),[actualParameter(e,_),_*]) := s };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_option")),[actualParameter(e,_),_*]) := s.files };
 }
 
 @doc{Extract the information on declared post metadata keys for the given system}
 PostMetaRel definedPostMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_post_meta")),[_,actualParameter(e,_),_*]) := s };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_post_meta")),[_,actualParameter(e,_),_*]) := s.files };
 }
 
 @doc{Extract the information on declared user metadata keys for the given system}
 UserMetaRel definedUserMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_user_meta")),[_,actualParameter(e,_),_*]) := s };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_user_meta")),[_,actualParameter(e,_),_*]) := s.files };
 }
 
 @doc{Extract the information on declared comment metadata keys for the given system}
 CommentMetaRel definedCommentMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_comment_meta")),[_,actualParameter(e,_),_*]) := s };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_comment_meta")),[_,actualParameter(e,_),_*]) := s.files };
 }
 
 // TODO: Include file resolution won't work for plugins, that would have to be done over
@@ -176,14 +185,14 @@ CommentMetaRel definedCommentMetaKeys(System s) {
 HRel definedFilters(System s) {
     HRel res = { };
     
-    for (/c:call(name(name("add_filter")), plist) := s, size(plist) >= 2) {
+    for (/c:call(name(name("add_filter")), plist) := s.files, size(plist) >= 2) {
         if (actualParameter(te:scalar(string(tagname)),_) := plist[0]) {
             if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
                 res = res + < name(name(tagname)), c@at, priority >;
             } else {
                 res = res + < name(name(tagname)), c@at, 10 >; // 10 is the default priority
             }
-        } if (actualParameter(te,_) := plist[0]) {
+        } else if (actualParameter(te,_) := plist[0]) {
 			if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
 			    res = res + < expr(te), c@at, priority >;
 			} else {
@@ -199,14 +208,14 @@ HRel definedFilters(System s) {
 HRel definedActions(System s) {
     HRel res = { };
     
-    for (/c:call(name(name("add_action")), plist) := s, size(plist) >= 2) {
+    for (/c:call(name(name("add_action")), plist) := s.files, size(plist) >= 2) {
         if (actualParameter(ae:scalar(string(actionName)),_) := plist[0]) {
             if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
                 res = res + < name(name(actionName)), c@at, priority >;
             } else {
                 res = res + < name(name(actionName)), c@at, 10 >; // 10 is the default priority
             }
-        } if (actualParameter(ae,_) := plist[0]) {
+        } else if (actualParameter(ae,_) := plist[0]) {
             if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
                 res = res + < expr(ae), c@at, priority >;
             } else {
@@ -246,13 +255,13 @@ public void extractPluginSummary(bool overwrite = true) {
 
 @doc{Find action hooks with computed names defined in the given system}
 set[Expr] findDerivedActionHooks(System sys) = 
-	{ e | /f:call(name(name("do_action")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } +
-	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
+	{ e | /f:call(name(name("do_action")),[actualParameter(e,_),_*]) := sys.files, scalar(string(_)) !:= e } +
+	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := sys.files, scalar(string(_)) !:= e };
 
 @doc{Find action hooks with literal names defined in the given system}
 set[str] findSimpleActionHooks(System sys) =
-	{ e | /f:call(name(name("do_action")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
-	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
+	{ e | /f:call(name(name("do_action")),[actualParameter(scalar(string(e)),_),_*]) := sys.files } +
+	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys.files };
 	
 @doc{Find all derived action hooks defined across all versions of WordPress}
 rel[str,Expr] findDerivedActionHooks() {
@@ -266,13 +275,13 @@ rel[str,str] findSimpleActionHooks() {
 
 @doc{Find filter hooks with computed names defined in the given system}
 set[Expr] findDerivedFilterHooks(System sys) = 
-	{ e | /f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } + 
-	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
+	{ e | /f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := sys.files, scalar(string(_)) !:= e } + 
+	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := sys.files, scalar(string(_)) !:= e };
 
 @doc{Find filter hooks with literal names defined in the given system}
 set[str] findSimpleFilterHooks(System sys) =
-	{ e | /f:call(name(name("apply_filters")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
-	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
+	{ e | /f:call(name(name("apply_filters")),[actualParameter(scalar(string(e)),_),_*]) := sys.files } +
+	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys.files };
 	
 @doc{Find all derived filter hooks defined across all versions of WordPress}
 rel[str,Expr] findDerivedFilterHooks() {
@@ -512,6 +521,18 @@ rel[str,str] pluginActions(str pluginName) {
 rel[str,str] pluginActions() {
 	list[loc] pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
 	return { < pn, sn > | l <- pluginDirs, exists(pluginInfoBin + "<l.file>-summary.bin"), < pn, sn > <- pluginActions(l.file) }; 
+}
+
+@doc{Return the actions defined in a given plugin.}
+rel[str,Expr,loc] unresolvedPluginActions(str pluginName) {
+    psum = loadPluginSummary(pluginName);
+	return { < pluginName, en, l > | < e, l, _ > <- psum.actions, expr(en) := e };
+}
+
+@doc{Return the actions defined in all plugins in the corpus with the plugin name as first projection}
+rel[str,Expr,loc] unresolvedPluginActions() {
+	list[loc] pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+	return { < pn, sn, el > | l <- pluginDirs, exists(pluginInfoBin + "<l.file>-summary.bin"), < pn, sn, el > <- unresolvedPluginActions(l.file) }; 
 }
 
 @doc{Given a rel of plugin x function, return a map that, for each function, gives the plugins where it is defined.}
