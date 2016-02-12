@@ -6,6 +6,8 @@ import lang::php::util::Corpus;
 import lang::php::util::Utils;
 import lang::php::util::Config;
 import lang::php::pp::PrettyPrinter;
+import lang::php::textsearch::Lucene;
+import lang::php::experiments::plugins::CommentSyntax;
 
 import Set;
 import Relation;
@@ -16,6 +18,8 @@ import String;
 import util::Math;
 import Map;
 import DateTime;
+import ParseTree;
+import Traversal;
 
 private loc pluginDir = baseLoc + "plugins";
 private loc pluginBin = baseLoc + "serialized/plugins";
@@ -111,10 +115,12 @@ public PluginInfo readPluginInfo(str s) {
 
 @doc{A relation from function names to the location of the function declaration}
 alias FRel = rel[str fname, loc at];
+@doc{A relation from class names to the location of the class declaration}
+alias CRel = rel[str cname, loc at];
 @doc{A relation from class x method names to the location of the method declaration}
-alias MRel = rel[str cname, str mname, loc at];
+alias MRel = rel[str cname, str mname, loc at, bool isPublic];
 @doc{The location of the hooks used inside the plugin}
-alias HRel = rel[NameOrExpr hookName, loc at, int priority];
+alias HRel = rel[NameOrExpr hookName, loc at, int priority, Expr regExpr];
 @doc{The location of the constants defined in the plugin}
 alias ConstRel = rel[str constName, loc at];
 @doc{The location of the class constants defined in the plugin}
@@ -129,53 +135,60 @@ alias PostMetaRel = rel[NameOrExpr postMetaKey, loc at];
 alias UserMetaRel = rel[NameOrExpr userMetaKey, loc at];
 @doc{Locations of uses of add_comment_meta}
 alias CommentMetaRel = rel[NameOrExpr commentMetaKey, loc at];
+@doc{Locations of registered hooks}
+alias RHRel = rel[NameOrExpr hookName, loc at];
 
 @doc{The plugin summary, containing extracted information about the plugin.}
-data PluginSummary = summary(PluginInfo pInfo, FRel functions, MRel methods, HRel filters, HRel actions, ConstRel consts, ClassConstRel classConsts, ShortcodeRel shortcodes, OptionRel options, PostMetaRel postMetaKeys, UserMetaRel userMetaKeys, CommentMetaRel commentMetaKeys);
+data PluginSummary = summary(PluginInfo pInfo, FRel functions, CRel classes, MRel methods, HRel filters, HRel actions, ConstRel consts, ClassConstRel classConsts, ShortcodeRel shortcodes, OptionRel options, PostMetaRel postMetaKeys, UserMetaRel userMetaKeys, CommentMetaRel commentMetaKeys, RHRel providedActionHooks, RHRel providedFilterHooks);
 
 @doc{Extract the information on declared functions for the given system}
 FRel definedFunctions(System s) {
-    return { < fname, f@at > | /f:function(fname,_,_,_) := s.files };
+    return { < fname, f@at > | /f:function(fname,_,_,_) := s };
+}
+
+@doc{Extract the information on declared classes for the given system}
+CRel definedClasses(System s) {
+    return { < cname, c@at > | /c:class(cname,_,_,_,members) := s };
 }
 
 @doc{Extract the information on declared methods for the given system}
 MRel definedMethods(System s) {
-    return { < cname, mname, m@at > | /c:class(cname,_,_,_,members) := s.files, m:method(mname,mods,_,_,_) <- members, \public() in mods || !(\private() in mods || \protected() in mods) };
+    return { < cname, mname, m@at, (\public() in mods || !(\private() in mods || \protected() in mods)) > | /c:class(cname,_,_,_,members) := s, m:method(mname,mods,_,_,_) <- members };
 }
 
 @doc{Extract the information on declared constants for the given system}
 ConstRel definedConstants(System s) {
-	return { < cn, c@at > | /c:call(name(name("define")),[actualParameter(scalar(string(cn)),false),actualParameter(e,false)]) := s.files };
+	return { < cn, c@at > | /c:call(name(name("define")),[actualParameter(scalar(string(cn)),false),actualParameter(e,false)]) := s };
 }
 
 @doc{Extract the information on declared class constants for the given system}
 ClassConstRel definedClassConstants(System s) {
-	return { < cn, name, cc@at > | /class(cn,_,_,_,cis) := s.files, constCI(consts) <- cis, cc:const(name,ce) <- consts };
+	return { < cn, name, cc@at > | /class(cn,_,_,_,cis) := s, constCI(consts) <- cis, cc:const(name,ce) <- consts };
 }
 
 @doc{Extract the information on declared WordPress shortcodes for the given system}
 ShortcodeRel definedShortcodes(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_shortcode")),[actualParameter(e,_),actualParameter(cb,_)]) := s.files };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_shortcode")),[actualParameter(e,_),actualParameter(cb,_)]) := s };
 }
 
 @doc{Extract the information on declared admin options for WordPress plugins for the given system}
 OptionRel definedOptions(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_option")),[actualParameter(e,_),_*]) := s.files };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_option")),[actualParameter(e,_),_*]) := s };
 }
 
 @doc{Extract the information on declared post metadata keys for the given system}
 PostMetaRel definedPostMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_post_meta")),[_,actualParameter(e,_),_*]) := s.files };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_post_meta")),[_,actualParameter(e,_),_*]) := s };
 }
 
 @doc{Extract the information on declared user metadata keys for the given system}
 UserMetaRel definedUserMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_user_meta")),[_,actualParameter(e,_),_*]) := s.files };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_user_meta")),[_,actualParameter(e,_),_*]) := s };
 }
 
 @doc{Extract the information on declared comment metadata keys for the given system}
 CommentMetaRel definedCommentMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_comment_meta")),[_,actualParameter(e,_),_*]) := s.files };
+	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_comment_meta")),[_,actualParameter(e,_),_*]) := s };
 }
 
 // TODO: Include file resolution won't work for plugins, that would have to be done over
@@ -185,18 +198,18 @@ CommentMetaRel definedCommentMetaKeys(System s) {
 HRel definedFilters(System s) {
     HRel res = { };
     
-    for (/c:call(name(name("add_filter")), plist) := s.files, size(plist) >= 2) {
+    for (/c:call(name(name("add_filter")), plist) := s, size(plist) >= 2) {
         if (actualParameter(te:scalar(string(tagname)),_) := plist[0]) {
             if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
-                res = res + < name(name(tagname)), c@at, priority >;
+                res = res + < name(name(tagname)), c@at, priority, c >;
             } else {
-                res = res + < name(name(tagname)), c@at, 10 >; // 10 is the default priority
+                res = res + < name(name(tagname)), c@at, 10, c >; // 10 is the default priority
             }
         } else if (actualParameter(te,_) := plist[0]) {
 			if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
-			    res = res + < expr(te), c@at, priority >;
+			    res = res + < expr(te), c@at, priority, c >;
 			} else {
-			    res = res + < expr(te), c@at, 10 >; // 10 is the default priority
+			    res = res + < expr(te), c@at, 10, c >; // 10 is the default priority
 			}
 		}
     }
@@ -208,18 +221,18 @@ HRel definedFilters(System s) {
 HRel definedActions(System s) {
     HRel res = { };
     
-    for (/c:call(name(name("add_action")), plist) := s.files, size(plist) >= 2) {
+    for (/c:call(name(name("add_action")), plist) := s, size(plist) >= 2) {
         if (actualParameter(ae:scalar(string(actionName)),_) := plist[0]) {
             if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
-                res = res + < name(name(actionName)), c@at, priority >;
+                res = res + < name(name(actionName)), c@at, priority, c >;
             } else {
-                res = res + < name(name(actionName)), c@at, 10 >; // 10 is the default priority
+                res = res + < name(name(actionName)), c@at, 10, c >; // 10 is the default priority
             }
         } else if (actualParameter(ae,_) := plist[0]) {
             if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
-                res = res + < expr(ae), c@at, priority >;
+                res = res + < expr(ae), c@at, priority, c >;
             } else {
-                res = res + < expr(ae), c@at, 10 >; // 10 is the default priority
+                res = res + < expr(ae), c@at, 10, c >; // 10 is the default priority
             }
         }
     }
@@ -229,13 +242,43 @@ HRel definedActions(System s) {
 
 @doc{Extract a relational summary of the given plugin, passed as a System}
 public PluginSummary extractPluginSummary(System pt) {
-	return summary(noInfo(), definedFunctions(pt), definedMethods(pt), definedFilters(pt), definedActions(pt), definedConstants(pt), definedClassConstants(pt), definedShortcodes(pt), definedOptions(pt), definedPostMetaKeys(pt), definedUserMetaKeys(pt), definedCommentMetaKeys(pt));
+	return summary(
+		noInfo(), 
+		definedFunctions(pt),
+		definedClasses(pt), 
+		definedMethods(pt), 
+		definedFilters(pt), 
+		definedActions(pt), 
+		definedConstants(pt), 
+		definedClassConstants(pt), 
+		definedShortcodes(pt), 
+		definedOptions(pt), 
+		definedPostMetaKeys(pt), 
+		definedUserMetaKeys(pt), 
+		definedCommentMetaKeys(pt), 
+		findSimpleActionHooksWithLocs(pt) + findDerivedActionHooksWithLocs(pt), 
+		findSimpleFilterHooksWithLocs(pt) + findDerivedFilterHooksWithLocs(pt));
 }
 
 @doc{Extract a relational summary of the given plugin from a pre-parsed plugin binary}
 public void extractPluginSummary(str pluginName) {
     pt = loadPluginBinary(pluginName);
-	s = summary(readPluginInfo(pluginName), definedFunctions(pt), definedMethods(pt), definedFilters(pt), definedActions(pt), definedConstants(pt), definedClassConstants(pt), definedShortcodes(pt), definedOptions(pt), definedPostMetaKeys(pt), definedUserMetaKeys(pt), definedCommentMetaKeys(pt));
+	s = summary(
+		readPluginInfo(pluginName), 
+		definedFunctions(pt),
+		definedClasses(pt),
+		definedMethods(pt), 
+		definedFilters(pt), 
+		definedActions(pt), 
+		definedConstants(pt), 
+		definedClassConstants(pt), 
+		definedShortcodes(pt), 
+		definedOptions(pt), 
+		definedPostMetaKeys(pt), 
+		definedUserMetaKeys(pt), 
+		definedCommentMetaKeys(pt), 
+		findSimpleActionHooksWithLocs(pt) + findDerivedActionHooksWithLocs(pt), 
+		findSimpleFilterHooksWithLocs(pt) + findDerivedFilterHooksWithLocs(pt));
     if (!exists(pluginInfoBin)) mkDirectory(pluginInfoBin);
     writeBinaryValueFile(pluginInfoBin + "<pluginName>-summary.bin", s);   
 }
@@ -254,14 +297,34 @@ public void extractPluginSummary(bool overwrite = true) {
 }
 
 @doc{Find action hooks with computed names defined in the given system}
+RHRel findDerivedActionHooksWithLocs(System sys) = 
+	{ < expr(e), f@at > | /f:call(name(name("do_action")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } +
+	{ < expr(e), f@at > | /f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
+
+@doc{Find action hooks with literal names defined in the given system}
+RHRel findSimpleActionHooksWithLocs(System sys) =
+	{ < name(name(e)), f@at > | /f:call(name(name("do_action")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
+	{ < name(name(e)), f@at > | /f:call(name(name("do_action_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
+
+@doc{Find filter hooks with computed names defined in the given system}
+RHRel findDerivedFilterHooksWithLocs(System sys) = 
+	{ < expr(e), f@at > | /f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } +
+	{ < expr(e), f@at > | /f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
+
+@doc{Find filter hooks with literal names defined in the given system}
+RHRel findSimpleFilterHooksWithLocs(System sys) =
+	{ < name(name(e)), f@at > | /f:call(name(name("apply_filters")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
+	{ < name(name(e)), f@at > | /f:call(name(name("apply_filters_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
+
+@doc{Find action hooks with computed names defined in the given system}
 set[Expr] findDerivedActionHooks(System sys) = 
-	{ e | /f:call(name(name("do_action")),[actualParameter(e,_),_*]) := sys.files, scalar(string(_)) !:= e } +
-	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := sys.files, scalar(string(_)) !:= e };
+	{ e | /f:call(name(name("do_action")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } +
+	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
 
 @doc{Find action hooks with literal names defined in the given system}
 set[str] findSimpleActionHooks(System sys) =
-	{ e | /f:call(name(name("do_action")),[actualParameter(scalar(string(e)),_),_*]) := sys.files } +
-	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys.files };
+	{ e | /f:call(name(name("do_action")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
+	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
 	
 @doc{Find all derived action hooks defined across all versions of WordPress}
 rel[str,Expr] findDerivedActionHooks() {
@@ -275,13 +338,13 @@ rel[str,str] findSimpleActionHooks() {
 
 @doc{Find filter hooks with computed names defined in the given system}
 set[Expr] findDerivedFilterHooks(System sys) = 
-	{ e | /f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := sys.files, scalar(string(_)) !:= e } + 
-	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := sys.files, scalar(string(_)) !:= e };
+	{ e | /f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } + 
+	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
 
 @doc{Find filter hooks with literal names defined in the given system}
 set[str] findSimpleFilterHooks(System sys) =
-	{ e | /f:call(name(name("apply_filters")),[actualParameter(scalar(string(e)),_),_*]) := sys.files } +
-	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys.files };
+	{ e | /f:call(name(name("apply_filters")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
+	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
 	
 @doc{Find all derived filter hooks defined across all versions of WordPress}
 rel[str,Expr] findDerivedFilterHooks() {
@@ -1075,14 +1138,38 @@ map[str,set[set[str]]] readClassClusteringResults() {
 
 void extractSummariesForWordPress() {
 	vs = getSortedVersions("WordPress");
-	vs40 = vs[indexOf(vs,"4.0")..];
-	for (v <- vs40) {
+	vs121 = vs[indexOf(vs,"1.2.1")..];
+	for (v <- vs121) {
 		pt = loadBinary("WordPress",v);
-		s = summary(noInfo(), definedFunctions(pt), definedMethods(pt), definedFilters(pt), definedActions(pt), definedConstants(pt), definedClassConstants(pt), definedShortcodes(pt), definedOptions(pt), definedPostMetaKeys(pt), definedUserMetaKeys(pt), definedCommentMetaKeys(pt));
-		writeBinaryValueFile(wpAsPluginBin + "wordpress-<v>-summary.bin", s);		
+		s = summary(
+			noInfo(), 
+			definedFunctions(pt),
+			definedClasses(pt), 
+			definedMethods(pt), 
+			definedFilters(pt), 
+			definedActions(pt), 
+			definedConstants(pt), 
+			definedClassConstants(pt), 
+			definedShortcodes(pt), 
+			definedOptions(pt), 
+			definedPostMetaKeys(pt), 
+			definedUserMetaKeys(pt), 
+			definedCommentMetaKeys(pt), 
+			findSimpleActionHooksWithLocs(pt) + findDerivedActionHooksWithLocs(pt), 
+			findSimpleFilterHooksWithLocs(pt) + findDerivedFilterHooksWithLocs(pt));
+			writeBinaryValueFile(wpAsPluginBin + "wordpress-<v>-summary.bin", s);		
 	}
 }
 
+@doc{Load the summary for the given plugin}
+PluginSummary loadWordpressPluginSummary(str version) {
+	return readBinaryValueFile(#PluginSummary, wpAsPluginBin + "wordpress-<version>-summary.bin");
+}
+
+bool wordpressPluginSummaryExists(str version) {
+	return exists(wpAsPluginBin + "wordpress-<version>-summary.bin");
+}
+ 
 void findCollisionsWithWordPress() {
 	vs = getSortedVersions("WordPress");
 	vs40 = vs[indexOf(vs,"4.0")..];
@@ -1246,3 +1333,973 @@ Conflicts findConflicts(PluginSummary sysSummary, set[str] plugins) {
 	// Return the summary of conflicts
 	return conflicts(conflictFunctions, conflictClasses, conflictMethods, conflictConsts, conflictClassConsts, conflictShortcodes, conflictOptions, conflictPostMeta, conflictUserMeta, conflictCommentMeta);
 }
+
+public data NamePart = literalPart(str s) | exprPart(Expr e);
+public alias NameModel = list[NamePart];
+
+public NameModel nameModel(Expr e) {
+	if (binaryOperation(l,r,concat()) := e) {
+		return [ *nameModel(l), *nameModel(r) ];
+	} else if (scalar(encapsed(el)) := e) {
+		return [ *nameModel(eli) | eli <- el ];
+	} else if (scalar(string(s)) := e) {
+		return [ literalPart(s) ];
+	} else {
+		return [ exprPart(e) ];
+	}
+}
+
+public NameModel nameModel(name(name(str s))) = [ literalPart(s) ];
+public NameModel nameModel(expr(Expr e)) = nameModel(e);
+
+public str regexpForNameModel(NameModel nm) {
+	list[str] parts = [ ];
+	for (nmi <- nm) {
+		if (literalPart(s) := nmi) {
+			parts = parts + s;
+		} else {
+			parts = parts + ".*";
+		}
+	}
+	return intercalate("",parts);
+}
+
+public int specificity(literalPart(str s)) = size(s);
+public int specificity(exprPart(Expr e)) = 0;
+
+public int specificity(NameModel nm) {
+	return (0 | it + specificity(i) | i <- nm );
+}
+
+public str stringForMatch(Expr e) {
+	if (binaryOperation(l,r,concat()) := e) {
+		return stringForMatch(l) + stringForMatch(r);
+	} else if (scalar(encapsed(el)) := e) {
+		return intercalate("", [stringForMatch(eli) | eli <- el]);
+	} else if (scalar(string(s)) := e) {
+		return s;
+	} else {
+		return "@"; // "@" cannot be a name, so this won't match with anything else
+	}
+}
+
+public str stringForMatch(expr(Expr e)) = stringForMatch(e);
+public str stringForMatch(name(name(str s))) = s;
+
+alias HookUses = rel[loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity];
+
+public HookUses resolveHooks(str pluginName) {
+	pt = loadPluginBinary(pluginName);
+	psum = loadPluginSummary(pluginName);
+	
+	HookUses res = { };
+	
+	if (psum.pInfo is pluginInfo && just(maxVersion) := psum.pInfo.testedUpTo) {
+		if (binaryExists("WordPress", maxVersion)) {
+			//wp = loadBinary("WordPress", maxVersion);
+			wpsum = loadWordpressPluginSummary(maxVersion);
+			
+			println("Resolving against version <maxVersion> of WordPress");
+			
+			// Build name models for each of the hooks defined in WordPress
+			rel[NameOrExpr hookName, loc at, NameModel model] wpActionModels = { < hn, at, nameModel(hn) > | < hn, at > <- wpsum.providedActionHooks };
+			rel[NameOrExpr hookName, loc at, NameModel model] wpFilterModels = { < hn, at, nameModel(hn) > | < hn, at > <- wpsum.providedFilterHooks };
+	
+			// Build name models for each of the hooks defined in the plugin itself
+			rel[NameOrExpr hookName, loc at, NameModel model] actionModels = { < hn, at, nameModel(hn) > | < hn, at > <- psum.providedActionHooks };
+			rel[NameOrExpr hookName, loc at, NameModel model] filterModels = { < hn, at, nameModel(hn) > | < hn, at > <- psum.providedFilterHooks };
+	
+			// Create subsets of the above where we have exact name matches, that way we only fall back on regular
+			// expression matching in cases where we define the def or use dynamically (note, here we are making
+			// an ASSUMPTION that, in these cases, this is the intended semantics).
+			rel[str hookName, loc at] wpActionsJustNames = { < s, at > | < name(name(str s)), at > <- wpsum.providedActionHooks };
+			rel[str hookName, loc at] wpFiltersJustNames = { < s, at > | < name(name(str s)), at > <- wpsum.providedFilterHooks };
+			rel[str hookName, loc at] actionsJustNames = { < s, at > | < name(name(str s)), at > <- psum.providedActionHooks };
+			rel[str hookName, loc at] filtersJustNames = { < s, at > | < name(name(str s)), at > <- psum.providedFilterHooks };
+			
+			println("Computed <size(wpActionModels)> for wordpress actions");
+			println("Computed <size(wpFilterModels)> for wordpress filters");
+			println("Computed <size(actionModels)> for plugin actions");
+			println("Computed <size(filterModels)> for plugin filters");
+			
+			// Build a regexp for each name model
+			map[NameModel model, str regexp] regexps = ( nm : regexpForNameModel(nm) | nm <- (wpActionModels<2> + wpFilterModels<2> + actionModels<2> + filterModels<2>) );
+			println("Computed <size(regexps)> name model to regexp mappings");
+			
+			println("Attempting to resolve <size(psum.filters)> filter uses and <size(psum.actions)> action uses");
+			
+			// Now, using these models, compute which of the actual uses match these models
+			HookUses localFilterMatches = { };
+			for ( < hnUse, useloc, _, reg > <- psum.filters ) {
+				bool doCheck = true;
+				if (name(name(str s)) := hnUse) {
+					for ( < s, defloc > <- filtersJustNames ) {
+						localFilterMatches = localFilterMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
+						doCheck = false;
+					}
+				}
+				if (doCheck) {
+					useString = stringForMatch(hnUse);
+					for ( < hnDef, defloc, nm > <- filterModels) {
+						try {
+							if (rexpMatch(useString, regexps[nm])) {
+								localFilterMatches = localFilterMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm) >;
+							}
+						} catch v : {
+							println("Bad regexp <regexps[nm]> caused by bug in source, skipping");
+						}
+					}
+				}
+			}
+			println("Local filter matches: <size(localFilterMatches)>");
+	
+			HookUses localActionMatches = { };
+			for ( < hnUse, useloc, _, reg > <- psum.actions ) {
+				bool doCheck = true;
+				if (name(name(str s)) := hnUse) {
+					for ( < s, defloc > <- actionsJustNames ) {
+						localActionMatches = localActionMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
+						doCheck = false;
+					}
+				}
+				if (doCheck) {
+					useString = stringForMatch(hnUse);
+					for ( < hnDef, defloc, nm > <- actionModels) {
+						try {
+							if (rexpMatch(useString, regexps[nm])) {
+								localActionMatches = localActionMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm) >;
+							}
+						} catch v : {
+							println("Bad regexp <regexps[nm]> caused by bug in source, skipping");
+						}
+					}
+				}	
+			}
+			println("Local action matches: <size(localActionMatches)>");
+	
+			HookUses wpFilterMatches = { };
+			for ( < hnUse, useloc, _, reg > <- psum.filters ) {
+				bool doCheck = true;
+				if (name(name(str s)) := hnUse) {
+					for ( < s, defloc > <- wpFiltersJustNames ) {
+						wpFilterMatches = wpFilterMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
+						doCheck = false;
+					}
+				}
+				if (doCheck) {
+					useString = stringForMatch(hnUse);
+					for ( < hnDef, defloc, nm > <- wpFilterModels) {
+						//println("Going to check against <regexps[nm]>");
+						try {
+							if (rexpMatch(useString, regexps[nm])) {
+								wpFilterMatches = wpFilterMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm) >;
+							}
+						} catch v : {
+							println("Bad regexp <regexps[nm]> caused by bug in source, skipping");
+						}
+					}	
+				}
+			}
+			println("WordPress filter matches: <size(wpFilterMatches)>");
+	
+			HookUses wpActionMatches = { };
+			for ( < hnUse, useloc, _, reg > <- psum.actions ) {
+				bool doCheck = true;
+				if (name(name(str s)) := hnUse) {
+					for ( < s, defloc > <- wpActionsJustNames ) {
+						wpActionMatches = wpActionMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
+						doCheck = false;
+					}
+				}
+				if (doCheck) {
+					useString = stringForMatch(hnUse);
+					for ( < hnDef, defloc, nm > <- wpActionModels) {
+						//println("Going to check against <regexps[nm]>");
+						try {
+							if (rexpMatch(useString, regexps[nm])) {
+								wpActionMatches = wpActionMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm) >;
+							}
+						} catch v : {
+							println("Bad regexp <regexps[nm]> caused by bug in source, skipping");
+						}
+					}	
+				}
+			}
+			println("WordPress action matches: <size(wpActionMatches)>");
+			
+			res = localFilterMatches + localActionMatches + wpFilterMatches + wpActionMatches;
+			
+			unresFilters = { < hnUse, useloc > | < hnUse, useloc, _, _ > <- psum.filters, < useloc, hnUse > notin res<0,1> };
+			unresActions = { < hnUse, useloc > | < hnUse, useloc, _, _ > <- psum.actions, < useloc, hnUse > notin res<0,1> };
+			println("Unresolved: <size(unresFilters)> filters and <size(unresActions)> actions");
+		} else {
+			println("No binary for WordPress version <maxVersion>");
+		}
+	} else {
+		println("Could not resolve hooks for <pluginName>, max WP version unknown");
+	}
+	
+	return res;
+}
+
+@doc{This gets a distribution of uses, but does not tie this to a specific use. It also
+     differentiates uses of the same hook across different versions.}
+public map[int,int] occurrenceDistribution(HookUses uses) {
+	map[int,int] res = ( );
+	for ( < ul, u > <- uses<0,1>) {
+		ucount = size(uses[ul,u]);
+		if (ucount in res) {
+			res[ucount] = res[ucount] + 1;
+		} else {
+			res[ucount] = 1;
+		}
+	} 
+	return res;
+}
+
+@doc{Extract plugin summaries for all pre-parsed plugin binaries}
+public void resolveHooks(bool overwrite = true) {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
+    	if ( (overwrite && exists(infoBin+"<l.file>-hook-uses.bin")) || !exists(infoBin+"<l.file>-hook-uses.bin")) { 
+	        println("Resolving hooks for plugin: <l.file>");
+	        res = resolveHooks(l.file);
+	        writeBinaryValueFile(infoBin+"<l.file>-hook-uses.bin", res);
+		} else {
+			println("Already resolved hooks for plugin: <l.file>");
+		}
+    }
+}
+
+@doc{Gives back a master relation of all uses across all plugins}
+public HookUses combineUses() {
+	HookUses res = { };
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file)), exists(infoBin+"<l.file>-hook-uses.bin")) {
+		hu = readBinaryValueFile(#HookUses, infoBin+"<l.file>-hook-uses.bin");
+		res = res + hu;
+	}
+	return res;
+}
+
+public list[str] problemPlugins() {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    return [ l.file | l <- pluginDirs, exists(getPluginBinLoc(l.file)), !exists(infoBin+"<l.file>-hook-uses.bin")]; 
+}
+
+// What diagrams do we want? What stats?
+// For each hook defined by WordPress, how many plugins use it?
+// For each hook defined by WordPress, how many times is it used?
+// For each plugin, how many hooks does it define locally?
+// For each plugin, how many of these local hooks are used?
+// For each plugin, how many hooks (actions/filters) does it use?
+// For each use, how many hooks does this resolve to on average?
+
+@doc{This acts as a check -- it looks over all the plugins and gives us the smallest version tested up to. We intended
+     to pull only plugins that were tested up to 4.0 or higher.}
+public str minVersionSupported() {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    v = "4.3";
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
+		psum = loadPluginSummary(l.file);
+		if (psum.pInfo is pluginInfo && just(maxVersion) := psum.pInfo.testedUpTo) {
+			if (maxVersion[-1] == ".") {
+				maxVersion = maxVersion + "0";
+				pieces = split(".", maxVersion);
+				try {
+					for (p <- pieces) toInt(p);
+				} catch _ : {
+					continue;
+				}
+			}
+			if (compareVersion(maxVersion,v)) {
+				v = maxVersion;
+			}
+		}
+	}
+	return v;
+}
+
+@doc{Normalize the WP version that is recorded in the plugin summary. For instance, sometimes 4.0 is given as 4., 4, or 4.0.0.}
+public void normalizeWPVersion() {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
+		psum = loadPluginSummary(l.file);
+		if (psum.pInfo is pluginInfo && just(maxVersion) := psum.pInfo.testedUpTo) {		
+			if (maxVersion in { "4.", "4", "4.0.0" }) maxVersion = "4.0";
+			else if (maxVersion in {"4.1.","4.1.0"}) maxVersion = "4.1";
+			else if (maxVersion in {"4.2.","4.2.0"}) maxVersion = "4.2";
+			else if (maxVersion in {"4.3.","4.3.0"}) maxVersion = "4.3";
+			
+			psum.pInfo.testedUpTo = just(maxVersion);
+			writeBinaryValueFile(pluginInfoBin + "<l.file>-summary.bin", psum);
+		}
+	}		
+}
+
+@doc{For each plugin, return the WP version that it has been tested up to. Note that we only do simple parsing of the version number,
+     in some cases people put additional information in this slot but we don't attempt to decipher it.}
+public rel[str,str] versionsUsed() {
+	rel[str,str] res = { };
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
+		psum = loadPluginSummary(l.file);
+		if (psum.pInfo is pluginInfo && just(maxVersion) := psum.pInfo.testedUpTo) {		
+			res = res + < l.file, maxVersion>;
+		} else {
+			res = res + < l.file, "unknown" >;
+		}
+	}
+	return res;
+}
+
+@doc{Return a map from WP version to the number of plugins that have been tested up to this version}
+public map[str,int] byVersion(set[str] versions = corpusVersions()) {
+	// Return the version with the number of plugins that use it
+	used = versionsUsed();
+	validVersions = versions;
+	map[str,int] counts = ( v : size(invert(used)[v]) | v <- used<1>, v in validVersions );
+	return counts;
+}
+
+@doc{Return a relation from version numbers to both filter and action hooks}
+public rel[str version, NameOrExpr hook] hooksByVersion(set[str] versions = corpusVersions()) {
+	rel[str version, NameOrExpr hook] res = { };
+	
+	for (v <- versions) {
+		wpsum = loadWordpressPluginSummary(v);
+		res = res + { < v, h > | h <- (wpsum.providedFilterHooks<0> + wpsum.providedActionHooks<0>) };
+	}
+	
+	return res;
+}
+
+@doc{Return a relation from version numbers to filter hooks}
+public rel[str version, NameOrExpr hook] filtersByVersion(set[str] versions = corpusVersions()) {
+	rel[str version, NameOrExpr hook] res = { };
+	
+	for (v <- versions) {
+		wpsum = loadWordpressPluginSummary(v);
+		res = res + { < v, h > | h <- (wpsum.providedFilterHooks<0>) };
+	}
+	
+	return res;
+}
+
+@doc{Return a relation from version numbers to action hooks}
+public rel[str version, NameOrExpr hook] actionsByVersion(set[str] versions = corpusVersions()) {
+	rel[str version, NameOrExpr hook] res = { };
+	
+	for (v <- versions) {
+		wpsum = loadWordpressPluginSummary(v);
+		res = res + { < v, h > | h <- (wpsum.providedActionHooks<0>) };
+	}
+	
+	return res;
+}
+
+@doc{This returns just those versions we are focusing on in this study}
+set[str] corpusVersions() = { v | v <- getVersions("WordPress"), v == "4.0" || ( compareVersion("4.0",v) && compareVersion(v,"4.3.2") ) };
+
+@doc{This returns a sorted list of just those versions we are focusing on in this study}
+list[str] sortedVersions() = [ v | v <- getSortedVersions("WordPress"), v == "4.0" || ( compareVersion("4.0",v) && compareVersion(v,"4.3.2") ) ];
+
+@doc{This returns all versions of WordPress that we have that include plugin support}
+set[str] wpVersionsWithPlugins() = { v | v <- getVersions("WordPress"), v == "1.2.1" || ( compareVersion("1.2.1",v) && compareVersion(v,"4.3.2") ) };
+
+@doc{This returns a sorted list of all versions of WordPress that we have that include plugin support}
+list[str] sortedWPVersionsWithPlugins() = [ v | v <- getSortedVersions("WordPress"), v == "1.2.1" || ( compareVersion("1.2.1",v) && compareVersion(v,"4.3.2") ) ];
+
+@doc{Given a relation from version numbers to hooks, return a map from version numbers to the number of hooks in that version}
+map[str version, int count] summarizeByVersion(rel[str version, NameOrExpr hook] hbv) {
+	return ( v : size(hbv[v]) | v <- hbv<0> );
+}
+
+@doc{Dump counts to a file so we can load them up in Excel or R and take a look at them}
+void dumpCountsByVersion(rel[str version, NameOrExpr hook] hbv, rel[str version, NameOrExpr hook] fbv, rel[str version, NameOrExpr hook] abv, loc dumpTo) {
+	dumpCountsByVersion(summarizeByVersion(hbv),summarizeByVersion(fbv),summarizeByVersion(abv),dumpTo);
+}
+
+@doc{Dump counts to a file so we can load them up in Excel or R and take a look at them}
+void dumpCountsByVersion(map[str version, int count] hbv, map[str version, int count] fbv, map[str version, int count] abv, loc dumpTo) {
+	list[str] lines = [ "<v>,<hbv[v]>,<fbv[v]>,<abv[v]>" | v <- sortedWPVersionsWithPlugins() ];
+	writeFile(dumpTo,intercalate("\n",lines));
+}
+
+public map[str,int] pluginDownloads() {
+	map[str,int] res = ( );
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
+    	println("Getting stats for <l.file>");
+    	try {
+	    	hftext = readFile(|https://wordpress.org/plugins| + l.file);
+			if(/UserDownloads:<c:\d+>/ := hftext) {
+				res[l.file] = toInt(c);
+				continue;
+			}
+		} catch _ : {
+			;
+		}
+		res[l.file] = -1;
+	}
+	return res;
+}
+
+public void writePluginDownloadCounts(map[str,int] counts) {
+	writeBinaryValueFile(pluginInfoBin + "download-counts.bin", counts);
+}
+
+map[str,int] readPluginDownloadCounts() {
+	return readBinaryValueFile(#map[str,int], pluginInfoBin + "download-counts.bin");
+}
+
+private lrel[num,num] computeCoords(list[num] inputs) {
+	return [ < idx+1, inputs[idx] > | idx <- index(inputs) ];
+}
+
+str computeTicks(list[str] vlist) {
+	displayThese = [ idx+1 | idx <- index(vlist), ((idx+1)%10==1) || (idx==size(vlist)-1) ];
+	return "xtick={<intercalate(",",displayThese)>}";
+}
+
+str computeTickLabels(list[str] vlist) {
+	displayThese = [ vlist[idx] | idx <- index(vlist), ((idx+1)%10==1) || (idx==size(vlist)-1) ];
+	return "xticklabels={<intercalate(",",displayThese)>}";
+}
+
+private str makeCoords(list[num] inputs, str mark="", str markExtra="", str legend="") {
+	return "\\addplot<if(size(mark)>0){>[mark=<mark><if(size(markExtra)>0){>,<markExtra><}>]<}> coordinates {
+		   '<intercalate(" ",[ "(<i>,<j>)" | < i,j > <- computeCoords(inputs)])>
+		   '};<if(size(legend)>0){>
+		   '\\addlegendentry{<legend>}<}>";
+}
+
+public str hooksChart(list[str] versions, map[str version, int count] fbv, map[str version, int count] abv, str title="Grown in WordPress Filter and Action Hooks, by Version", str label="fig:Hooks", str markExtra="mark phase=1,mark repeat=5") {
+	list[str] coordinateBlocks = [ ];
+	coordinateBlocks += makeCoords([ fbv[v] | v <- versions, v in fbv ], mark="o", markExtra=markExtra, legend="Filters");
+	coordinateBlocks += makeCoords([ abv[v] | v <- versions, v in abv ], mark="x", markExtra=markExtra, legend="Actions");
+
+	int maxcoord() {
+		return max([ fbv[v] | v <- versions, v in fbv ] +
+				   [ abv[v] | v <- versions, v in abv ]) + 10;
+	}
+		
+	str res = "\\begin{figure*}
+			  '\\centering
+			  '\\begin{tikzpicture}
+			  '\\begin{axis}[width=\\textwidth,height=.25\\textheight,xlabel=Version,ylabel=Count,xmin=1,ymin=0,xmax=<size(versions)>,ymax=<maxcoord()>,legend style={at={(0,1)},anchor=north west},x tick label style={rotate=90,anchor=east},<computeTicks(versions)>,<computeTickLabels(versions)>]
+			  '<for (cb <- coordinateBlocks) {> <cb> <}>
+			  '\\end{axis}
+			  '\\end{tikzpicture}
+			  '\\caption{<title>.\\label{<label>}} 
+			  '\\end{figure*}
+			  ";
+	return res;	
+}
+
+public str makeHooksChart() {
+	fbv = filtersByVersion(versions=wpVersionsWithPlugins());
+	abv = actionsByVersion(versions=wpVersionsWithPlugins());
+	versions = sortedWPVersionsWithPlugins();
+	
+	return hooksChart(versions,summarizeByVersion(fbv),summarizeByVersion(abv));
+}
+
+public void sampleQueries() {
+
+	huFunctionCalls = { h | h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(scalar(string(_)),_),_*]) <- huCalls };
+	huMethodCalls = { h | h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,_,_),arrayElement(_,_,_)]),_),_*]) <- huCalls };
+	huMethodCalls2 = { h | h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,_,_),arrayElement(_,scalar(string(_)),_)]),_),_*]) <- huCalls };
+	huMethodCalls3 = { h | h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,var(name(name("this"))),_),arrayElement(_,scalar(string(_)),_)]),_),_*]) <- huCalls };
+	huMethodCalls4 = { h | h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,scalar(string(_)),_),arrayElement(_,scalar(string(_)),_)]),_),_*]) <- huCalls };
+	huOther = huCalls - (huFunctionCalls + huMethodCalls);
+	huDynFunctionCalls = { h | h:call(name(name(_)),[actualParameter(e,_),actualParameter(scalar(string(_)),_),_*]) <- huCalls, scalar(string(_)) !:= e };
+}
+
+// alias HookUses = rel[loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity];
+
+data HookUseTarget 
+	= functionTarget(str fname, loc at)
+	| unknownFunctionTarget(str fname) 
+	| methodTarget(str cname, str mname, loc at)
+	| potentialMethodTarget(str cname, str mname, loc at) 
+	| staticMethodTarget(str cname, str mname, loc at)
+	| unknownMethodTarget(str mname) 
+	| unknownTarget()
+	| unresolvedTarget()
+	;
+
+alias HookUsesResolved = rel[loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity, HookUseTarget target];
+
+public bool insideLoc(loc at, loc container) {
+	return 
+		container.file == at.file && 
+		container.begin.line <= at.begin.line &&
+		container.begin.column <= at.begin.column &&
+		container.end.line >= at.end.line &&
+		container.end.column >= at.end.column;
+}
+
+public HookUsesResolved resolveCallbacks(str pluginName) {
+	HookUsesResolved res = { };
+
+	psum = loadPluginSummary(pluginName);
+	wpsum = (psum.pInfo is pluginInfo && just(maxVersion) := psum.pInfo.testedUpTo && wordpressPluginSummaryExists(maxVersion)) ? loadWordpressPluginSummary(maxVersion) : loadWordpressPluginSummary("4.3.1"); 
+
+	hu = readBinaryValueFile(#HookUses, infoBin+"<pluginName>-hook-uses.bin");
+	for (< loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity > <- hu) {
+		if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(scalar(string(fn)),_),_*]) := reg) {
+			// These are the cases for where the call target is given as a string.
+			if (fn in psum.functions<0>) {
+				// In this case, the target is an actual function provided by the plugin
+				res = res + { < usedAt, use, defAt, def, reg, specificity, functionTarget(fn,at) > | < fn,at> <- psum.functions };
+			} else if (fn in wpsum.functions<0>) {
+				// In this case, the target in an actual function provided by WordPress
+				res = res + { < usedAt, use, defAt, def, reg, specificity, functionTarget(fn,at) > | < fn,at> <- wpsum.functions };			
+			} else if (contains(fn,"::")) {
+				// Here the target is a static method on a class, given as ClassName::MethodName
+				pieces = split(fn,"::");
+				methodName = pieces[-1];
+				classPieces = split(intercalate("::",pieces[..-1]),"\\\\");
+				className = classPieces[-1];
+
+				possibleMethods = { < className, methodName, at > | < className, methodName, at, _ > <- (psum.methods + wpsum.methods) };
+
+				if (size(possibleMethods) > 0) {
+					res = res + { < usedAt, use, defAt, def, reg, specificity, staticMethodTarget(cname, mname, at) > | < className, methodName, at > <- possibleMethods };
+				} else {
+					res = res + < usedAt, use, defAt, def, reg, specificity, unknownMethodTarget(methodName) >;
+				}
+			} else if (contains(fn,"\\\\")) {
+				// Here the target is a function given with the namespace (which technically isn't supported by WordPress)
+				functionPieces = split(fn,"\\\\");
+				functionName = functionPieces[-1];
+				if (functionName in psum.functions<0>) {
+					res = res + { < usedAt, use, defAt, def, reg, specificity, functionTarget(functionName,at) > | < functionName,at> <- psum.functions };
+				} else if (functionName in wpsum.functions<0>) {
+					res = res + { < usedAt, use, defAt, def, reg, specificity, functionTarget(functionName,at) > | < functionName,at> <- wpsum.functions };
+				}				
+			} else {
+				// If we don't identify the function based on those categories, this is an unknown function
+				res = res + < usedAt, use, defAt, def, reg, specificity, unknownFunctionTarget(fn) >;
+			}
+		} else if (h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,var(name(name("this"))),_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
+			// This is a method call on $this
+			containerClasses = { cname | < cname, at > <- psum.classes, insideLoc(defAt,at) };
+			possibleMethods = { < cname, mn, at > | cname <- containerClasses, < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			if (size(possibleMethods) > 0) {
+				res = res + { < usedAt, use, defAt, def, reg, specificity, methodTarget(cname, mname, at) > | < cname, mname, at > <- possibleMethods };
+			} else {
+				res = res + < usedAt, use, defAt, def, reg, specificity, unknownMethodTarget(mn) >;
+			}
+		} else if (h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,Expr e,_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
+			// This is a method call on some expression, since we don't have types we do a probable match
+			possibleMethods = { < cname, mn, at > | < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			if (size(possibleMethods) > 0) {
+				res = res + { < usedAt, use, defAt, def, reg, specificity, potentialMethodTarget(cname, mname, at) > | < cname, mname, at > <- possibleMethods };
+			} else {
+				res = res + < usedAt, use, defAt, def, reg, specificity, unknownMethodTarget(mn) >;
+			}
+		} else if (h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,scalar(string(cn)),_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
+			// This is a static method call, given instead as array elements, e.g., array("ClassName","MethodName")
+			possibleMethods = { < cn, mn, at > | < cn, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			if (size(possibleMethods) > 0) {
+				res = res + { < usedAt, use, defAt, def, reg, specificity, staticMethodTarget(cname, mname, at) > | < cname, mname, at > <- possibleMethods };
+			} else {
+				res = res + < usedAt, use, defAt, def, reg, specificity, unknownMethodTarget(mn) >;
+			}
+		} else {
+			res = res + < usedAt, use, defAt, def, reg, specificity, unresolvedTarget() >;
+		}
+	}
+	return res;
+}
+
+public HookUsesResolved resolveCallbacks() {
+	HookUsesResolved res = { };
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
+    	println("Resolving callbacks for <l.file>");
+		res = res + resolveCallbacks(l.file);
+	}
+	return res;
+}
+
+private loc indexBase = |file:///Users/mhills/PHPAnalysis/lucene|;
+private loc indexMaps = |file:///Users/mhills/PHPAnalysis/serialized/lucene-indexes|;
+
+public list[Line] getLines(Comment c) {
+	list[Line] matchLine(Lines ls) {
+		if (ls is singleLine) {
+			return [ ls.line ];
+		} else if (ls is multipleLines) {
+			return [ ls.line ] + matchLine(ls.lines);
+		} else {
+			println("We have a problem!");
+			throw "Problem!";
+		}
+	}
+	return matchLine(c.lines);
+}
+
+public str getTextFromTextLines(list[Line] ls) {
+	if (size(ls) > 0 && head(ls) is onlyLine) return "<head(ls).text>";
+	while (size(ls) > 0 && !(head(ls) is textLine)) ls = tail(ls);
+	list[Line] textLines = [ ];
+	while (size(ls) > 0 && head(ls) is textLine) { textLines += head(ls); ls = tail(ls); }
+	return intercalate(" ", [ "<l.text>" | l <- textLines ] );
+}
+
+public str getTextFromTaggedLines(list[Line] ls) {
+	if (size(ls) > 0 && head(ls) is onlyTaggedLine) return "<head(ls).text>";
+	while (size(ls) > 0 && !(head(ls) is taggedLine || head(ls) is justTaggedLine)) ls = tail(ls);
+	return intercalate(" ", [ "<l.text>" | l <- ls, l has text ] );
+}
+
+public map[str,str] buildCommentMap(Comment c, map[str,str] commentMap) {
+	commentLines = getLines(c);
+	text = getTextFromTextLines(commentLines);
+	tags = getTextFromTaggedLines(commentLines);
+	if (size(trim(text)) > 0) commentMap["text"] = trim(text);
+	if (size(trim(tags)) > 0) commentMap["tags"] = trim(tags);
+	return commentMap;
+}
+
+// Parsing isn't working well, it is generating ambiguities; for now,
+// just split on an "@" if we find one.
+public map[str,str] buildCommentMap(str c, map[str,str] commentMap, Expr e) {
+	commentMap["hook"] = pp(e);
+	commentMap["hookparts"] = intercalate(" ", [ p | p <- split("_",pp(e)), p != "wp", size(p) > 2]);
+	text = ""; tags = ""; c = trim(c);
+	firstAt = findFirst(c,"@");
+	if (firstAt > 0) {
+		text = c[0..firstAt];
+		tags = c[firstAt..];
+	} else if (firstAt == -1) {
+		text = c;
+	} else {
+		tags = c;
+	}
+	commentMap["text"] = text;
+	commentMap["tags"] = tags;
+	return commentMap;
+	//if (size(trim(c)) > 0) {
+	//	lastParsed = c;
+	//	return buildCommentMap(parse(#Comment,c), commentMap);
+	//} else {
+	//	return commentMap;
+	//}
+}
+
+public void buildPluginIndexes() {
+	for (v <- sortedWPVersionsWithPlugins()) {
+		println("Building index for WordPress <v>");
+		indexLoc = indexBase + "wordpress-<v>";
+		openIndex(indexLoc);
+
+		pt = normalizeComments(loadBinary("WordPress", v));
+		map[int,Expr] idMap = ( );
+		int id = 1;
+		
+		for (/f:call(name(name("do_action")),[actualParameter(e,_),_*]) := pt) {
+			if ( (f@phpdoc)? ) {
+				idMap[id] = e;
+				addDocument( buildCommentMap(f@phpdoc, ("id" : "<id>", "type" : "action"), e) );		
+			} else {
+				addDocument( buildCommentMap("", ("id" : "<id>", "type" : "action"), e) );
+			}
+			id += 1;
+		}
+
+		for (/f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := pt) {
+			if ( (f@phpdoc)? ) {
+				idMap[id] = e;
+				addDocument( buildCommentMap(f@phpdoc, ("id" : "<id>", "type" : "action"), e) );		
+			} else {
+				addDocument( buildCommentMap("", ("id" : "<id>", "type" : "action"), e) );
+			}
+			id += 1;
+		}
+
+		for (/f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := pt) {
+			if ( (f@phpdoc)? ) {
+				idMap[id] = e;
+				addDocument( buildCommentMap(f@phpdoc, ("id" : "<id>", "type" : "filter"), e) );		
+			} else {
+				addDocument( buildCommentMap("", ("id" : "<id>", "type" : "filter"), e) );
+			}
+			id += 1;
+		}
+
+		for (/f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := pt) {
+			if ( (f@phpdoc)? ) {
+				idMap[id] = e;
+				addDocument( buildCommentMap(f@phpdoc, ("id" : "<id>", "type" : "filter"), e) );		
+			} else {
+				addDocument( buildCommentMap("", ("id" : "<id>", "type" : "filter"), e) );
+			}
+			id += 1;
+		}
+		
+		closeIndex();
+		saveIndexMap(idMap,v);
+	}	
+}
+
+public void checkCommentParser() {
+	for (v <- sortedWPVersionsWithPlugins()) {
+		checkCommentParser(v);
+	}
+}
+
+public str lastParsed = "";
+
+public void checkCommentParser(str v) {
+	println("Parsing comments for WordPress <v>");
+
+	pt = normalizeComments(loadBinary("WordPress", v));
+	
+	for (/f:call(name(name("do_action")),[actualParameter(e,_),_*]) := pt) {
+		if ( (f@phpdoc)? ) {
+			println("Checking at location <f@at>");
+			lastParsed = f@phpdoc;
+			cpt = parse(#Comment,f@phpdoc);
+		}
+	}
+
+	for (/f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := pt) {
+		if ( (f@phpdoc)? ) {
+			println("Checking at location <f@at>");
+			lastParsed = f@phpdoc;
+			cpt = parse(#Comment,f@phpdoc);
+		}
+	}
+
+	for (/f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := pt) {
+		if ( (f@phpdoc)? ) {
+			println("Checking at location <f@at>");
+			lastParsed = f@phpdoc;
+			cpt = parse(#Comment,f@phpdoc);
+		}
+	}
+
+	for (/f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := pt) {
+		if ( (f@phpdoc)? ) {
+			println("Checking at location <f@at>");
+			lastParsed = f@phpdoc;
+			cpt = parse(#Comment,f@phpdoc);
+		}
+	}
+}
+
+public System normalizeComments(System sys) {
+	return ( l : normalizeComments(sys[l]) | l <- sys );
+}
+
+public list[Stmt] lastList = [ ];
+
+public Script normalizeComments(Script s) {
+	s = bottom-up visit(s) {
+		case f:call(name(name("do_action")), _) : {
+			if ( (f@phpdoc)? && size(trim(f@phpdoc)) > 0) {
+				; // this is fine
+			} else {
+				tc = getTraversalContext();
+				// Look back up through the context to find the containing statement, we may have the call as a standalone
+				// expression or it may be nested inside other expressions, inside strings, etc.
+				while (size(tc) >= 1 && Stmt stmt !:= head(tc)) tc = tail(tc);
+				if (size(tc) >= 1 && Stmt stmt := head(tc)) {
+					// If we found it, check to see if it has a doc comment. If so, use that one.
+					if ( (stmt@phpdoc)? && size(trim(stmt@phpdoc)) > 0) {
+						insert(f[@phpdoc=stmt@phpdoc]);
+					} else {
+						// If it doesn't, it may be the case that this statement is one of a list of statements.
+						// Check here to see if that is true.
+						tc = tail(tc);
+						if (size(tc) >= 1 && list[Stmt] slist := head(tc)) {
+							// If that is true, we want to look at the elements in the list before this one; if one
+							// of them has a doc comment, we will use that, assuming it is a reasonable distance
+							// away.
+							sIndex = indexOf(slist, stmt);
+							if (sIndex == -1) {
+								println("Error, statement not found but should be present");
+							} else {
+								if (sIndex > 0) {
+									if (f@at.begin.line == 291) {
+										lastList = slist;
+									}
+									listToSearch = [ li | li <- reverse(slist[0..sIndex]), li is inlineHTML, (li@phpdoc)? && (size(trim(li@phpdoc)) > 0) ];
+									if (size(listToSearch) > 0) {
+										foundIndex = indexOf(slist, head(listToSearch));
+										if (sIndex - foundIndex <= 2) {
+											// This is arbitrary, but is says that, if the first statement with a doc comment is
+											// one of the prior 3, use that. Normally it will be just one, but this gives us a
+											// bit of play without allowing truly distant comments to be used instead.
+											insert(f[@phpdoc=head(listToSearch)@phpdoc]);
+										}
+									}									
+								}
+							}
+						} else {
+							println("Unhandled case, statement was not in a list");
+						}
+					}
+				}
+			}
+		}
+
+		case f:call(name(name("do_action_ref_array")), _) : {
+			if ( (f@phpdoc)? && size(trim(f@phpdoc)) > 0) {
+				; // this is fine
+			} else {
+				tc = getTraversalContext();
+				// Look back up through the context to find the containing statement, we may have the call as a standalone
+				// expression or it may be nested inside other expressions, inside strings, etc.
+				while (size(tc) >= 1 && Stmt stmt !:= head(tc)) tc = tail(tc);
+				if (size(tc) >= 1 && Stmt stmt := head(tc)) {
+					// If we found it, check to see if it has a doc comment. If so, use that one.
+					if ( (stmt@phpdoc)? && size(trim(stmt@phpdoc)) > 0) {
+						insert(f[@phpdoc=stmt@phpdoc]);
+					} else {
+						// If it doesn't, it may be the case that this statement is one of a list of statements.
+						// Check here to see if that is true.
+						tc = tail(tc);
+						if (size(tc) >= 1 && list[Stmt] slist := head(tc)) {
+							// If that is true, we want to look at the elements in the list before this one; if one
+							// of them has a doc comment, we will use that, assuming it is a reasonable distance
+							// away.
+							sIndex = indexOf(slist, stmt);
+							if (sIndex == -1) {
+								println("Error, statement not found but should be present");
+							} else {
+								if (sIndex > 0) {
+									listToSearch = [ li | li <- reverse(slist[0..sIndex]), li is inlineHTML, (li@phpdoc)? && (size(trim(li@phpdoc)) > 0) ];
+									if (size(listToSearch) > 0) {
+										foundIndex = indexOf(slist, head(listToSearch));
+										if (sIndex - foundIndex <= 2) {
+											// This is arbitrary, but is says that, if the first statement with a doc comment is
+											// one of the prior 3, use that. Normally it will be just one, but this gives us a
+											// bit of play without allowing truly distant comments to be used instead.
+											insert(f[@phpdoc=head(listToSearch)@phpdoc]);
+										}
+									}									
+								}
+							}
+						} else {
+							println("Unhandled case, statement was not in a list");
+						}
+					}
+				}
+			}
+		}
+		
+		case f:call(name(name("apply_filters")), _)  : {
+			if ( (f@phpdoc)? && size(trim(f@phpdoc)) > 0) {
+				; // this is fine
+			} else {
+				tc = getTraversalContext();
+				// Look back up through the context to find the containing statement, we may have the call as a standalone
+				// expression or it may be nested inside other expressions, inside strings, etc.
+				while (size(tc) >= 1 && Stmt stmt !:= head(tc)) tc = tail(tc);
+				if (size(tc) >= 1 && Stmt stmt := head(tc)) {
+					// If we found it, check to see if it has a doc comment. If so, use that one.
+					if ( (stmt@phpdoc)? && size(trim(stmt@phpdoc)) > 0) {
+						insert(f[@phpdoc=stmt@phpdoc]);
+					} else {
+						// If it doesn't, it may be the case that this statement is one of a list of statements.
+						// Check here to see if that is true.
+						tc = tail(tc);
+						if (size(tc) >= 1 && list[Stmt] slist := head(tc)) {
+							// If that is true, we want to look at the elements in the list before this one; if one
+							// of them has a doc comment, we will use that, assuming it is a reasonable distance
+							// away.
+							sIndex = indexOf(slist, stmt);
+							if (sIndex == -1) {
+								println("Error, statement not found but should be present");
+							} else {
+								if (sIndex > 0) {
+									listToSearch = [ li | li <- reverse(slist[0..sIndex]), li is inlineHTML, (li@phpdoc)? && (size(trim(li@phpdoc)) > 0) ];
+									if (size(listToSearch) > 0) {
+										foundIndex = indexOf(slist, head(listToSearch));
+										if (sIndex - foundIndex <= 2) {
+											// This is arbitrary, but is says that, if the first statement with a doc comment is
+											// one of the prior 3, use that. Normally it will be just one, but this gives us a
+											// bit of play without allowing truly distant comments to be used instead.
+											insert(f[@phpdoc=head(listToSearch)@phpdoc]);
+										}
+									}									
+								}
+							}
+						} else {
+							println("Unhandled case, statement was not in a list");
+						}
+					}
+				}
+			}
+		}
+		
+		case f:call(name(name("apply_filters_ref_array")), _)  : {
+			if ( (f@phpdoc)? && size(trim(f@phpdoc)) > 0) {
+				; // this is fine
+			} else {
+				tc = getTraversalContext();
+				// Look back up through the context to find the containing statement, we may have the call as a standalone
+				// expression or it may be nested inside other expressions, inside strings, etc.
+				while (size(tc) >= 1 && Stmt stmt !:= head(tc)) tc = tail(tc);
+				if (size(tc) >= 1 && Stmt stmt := head(tc)) {
+					// If we found it, check to see if it has a doc comment. If so, use that one.
+					if ( (stmt@phpdoc)? && size(trim(stmt@phpdoc)) > 0) {
+						insert(f[@phpdoc=stmt@phpdoc]);
+					} else {
+						// If it doesn't, it may be the case that this statement is one of a list of statements.
+						// Check here to see if that is true.
+						tc = tail(tc);
+						if (size(tc) >= 1 && list[Stmt] slist := head(tc)) {
+							// If that is true, we want to look at the elements in the list before this one; if one
+							// of them has a doc comment, we will use that, assuming it is a reasonable distance
+							// away.
+							sIndex = indexOf(slist, stmt);
+							if (sIndex == -1) {
+								println("Error, statement not found but should be present");
+							} else {
+								if (sIndex > 0) {
+									listToSearch = [ li | li <- reverse(slist[0..sIndex]), li is inlineHTML, (li@phpdoc)? && (size(trim(li@phpdoc)) > 0) ];
+									if (size(listToSearch) > 0) {
+										foundIndex = indexOf(slist, head(listToSearch));
+										if (sIndex - foundIndex <= 2) {
+											// This is arbitrary, but is says that, if the first statement with a doc comment is
+											// one of the prior 3, use that. Normally it will be just one, but this gives us a
+											// bit of play without allowing truly distant comments to be used instead.
+											insert(f[@phpdoc=head(listToSearch)@phpdoc]);
+										}
+									}									
+								}
+							}
+						} else {
+							println("Unhandled case, statement was not in a list");
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return s;
+}
+
+public void saveIndexMap(map[int,Expr] imap, str version) {
+	writeBinaryValueFile(indexMaps + "wordpress-<version>.bin", imap);
+}
+
+public map[int,Expr] loadIndexMap(str version) {
+	return readBinaryValueFile(#map[int,Expr], indexMaps + "wordpress-<version>.bin");
+}
+
+public lrel[int,str,loc]  queryPluginIndex(str queryTerm, str version) {
+	indexLoc = indexBase + "wordpress-<version>";
+	prepareQueryEngine(indexLoc);
+	ids = [ toInt(i) | i <- runQuery(queryTerm) ];
+	imap = loadIndexMap(version);
+	return [ < i, pp(imap[i]), imap[i]@at > | i <- ids ]; 
+}
+
