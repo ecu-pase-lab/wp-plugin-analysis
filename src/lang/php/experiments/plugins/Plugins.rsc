@@ -8,6 +8,8 @@ import lang::php::util::Config;
 import lang::php::pp::PrettyPrinter;
 import lang::php::textsearch::Lucene;
 import lang::php::experiments::plugins::CommentSyntax;
+import lang::php::analysis::evaluators::AlgebraicSimplification;
+import lang::php::analysis::evaluators::SimulateCalls;
 
 import Set;
 import Relation;
@@ -122,9 +124,9 @@ alias MRel = rel[str cname, str mname, loc at, bool isPublic];
 @doc{The location of the hooks used inside the plugin}
 alias HRel = rel[NameOrExpr hookName, loc at, int priority, Expr regExpr];
 @doc{The location of the constants defined in the plugin}
-alias ConstRel = rel[str constName, loc at];
+alias ConstRel = rel[str constName, loc at, Expr constExpr];
 @doc{The location of the class constants defined in the plugin}
-alias ClassConstRel = rel[str cname, str constName, loc at];
+alias ClassConstRel = rel[str cname, str constName, loc at, Expr constExpr];
 @doc{The location of shortcode registrations}
 alias ShortcodeRel = rel[NameOrExpr scname, loc at];
 @doc{Locations of uses of add_option}
@@ -158,12 +160,12 @@ MRel definedMethods(System s) {
 
 @doc{Extract the information on declared constants for the given system}
 ConstRel definedConstants(System s) {
-	return { < cn, c@at > | /c:call(name(name("define")),[actualParameter(scalar(string(cn)),false),actualParameter(e,false)]) := s };
+	return { < cn, c@at, e > | /c:call(name(name("define")),[actualParameter(scalar(string(cn)),false),actualParameter(e,false)]) := s };
 }
 
 @doc{Extract the information on declared class constants for the given system}
 ClassConstRel definedClassConstants(System s) {
-	return { < cn, name, cc@at > | /class(cn,_,_,_,cis) := s, constCI(consts) <- cis, cc:const(name,ce) <- consts };
+	return { < cn, name, cc@at, ce > | /class(cn,_,_,_,cis) := s, constCI(consts) <- cis, cc:const(name,ce) <- consts };
 }
 
 @doc{Extract the information on declared WordPress shortcodes for the given system}
@@ -1337,20 +1339,46 @@ Conflicts findConflicts(PluginSummary sysSummary, set[str] plugins) {
 public data NamePart = literalPart(str s) | exprPart(Expr e);
 public alias NameModel = list[NamePart];
 
-public NameModel nameModel(Expr e) {
-	if (binaryOperation(l,r,concat()) := e) {
-		return [ *nameModel(l), *nameModel(r) ];
-	} else if (scalar(encapsed(el)) := e) {
-		return [ *nameModel(eli) | eli <- el ];
-	} else if (scalar(string(s)) := e) {
-		return [ literalPart(s) ];
-	} else {
-		return [ exprPart(e) ];
+public Expr replaceClassConsts(Expr e, loc el, PluginSummary psum) {
+	containerClasses = { cname | < cname, at > <- psum.classes, insideLoc(el,at) };
+	if (size(containerClasses) == 1) {
+		cname = getOneFrom(containerClasses);
+		possibleClassConsts = { < xname,  d > | < cname, xname, at, d > <- psum.classConsts };
+		e = bottom-up visit(e) {
+			case fcc:fetchClassConst(name(name("self")),cn) : {
+				possibleMatches = possibleClassConsts[cn];
+				if (size(possibleMatches) == 1) {
+					insert(getOneFrom(possibleMatches));
+				}
+			}
+		}
 	}
+	return e;
 }
 
-public NameModel nameModel(name(name(str s))) = [ literalPart(s) ];
-public NameModel nameModel(expr(Expr e)) = nameModel(e);
+public NameModel nameModel(Expr e, PluginSummary psum) {
+	loc el = e@at;
+	solve(e) {
+		e = simulateCall(algebraicSimplification(replaceClassConsts(e,el,psum)));
+	}
+
+	NameModel nameModelInternal(Expr e) {
+		if (binaryOperation(l,r,concat()) := e) {
+			return [ *nameModelInternal(l), *nameModelInternal(r) ];
+		} else if (scalar(encapsed(elist)) := e) {
+			return [ *nameModelInternal(eli) | eli <- elist ];
+		} else if (scalar(string(s)) := e) {
+			return [ literalPart(s) ];
+		} else {
+			return [ exprPart(e) ];
+		}
+	}
+	
+	return nameModelInternal(e);
+}
+
+public NameModel nameModel(name(name(str s)), PluginSummary psum) = [ literalPart(s) ];
+public NameModel nameModel(expr(Expr e), PluginSummary psum) = nameModel(e, psum);
 
 public str regexpForNameModel(NameModel nm) {
 	list[str] parts = [ ];
@@ -1367,15 +1395,24 @@ public str regexpForNameModel(NameModel nm) {
 public int specificity(literalPart(str s)) = size(s);
 public int specificity(exprPart(Expr e)) = 0;
 
-public int specificity(NameModel nm) {
+public int specificity(NameModel nm, str toMatch) {
+	allAts = findAll(toMatch,"@");
+	if ([literalPart(str s)] := nm && size(allAts) == 0) {
+		return 99; // This is very specific, neither part is a regexp match
+	}
 	return (0 | it + specificity(i) | i <- nm );
 }
 
-public str stringForMatch(Expr e) {
+public str stringForMatch(Expr e, PluginSummary psum) {
+	loc el = e@at;
+	solve(e) {
+		e = simulateCall(algebraicSimplification(replaceClassConsts(e,el,psum)));
+	}
+
 	if (binaryOperation(l,r,concat()) := e) {
-		return stringForMatch(l) + stringForMatch(r);
+		return stringForMatch(l,psum) + stringForMatch(r,psum);
 	} else if (scalar(encapsed(el)) := e) {
-		return intercalate("", [stringForMatch(eli) | eli <- el]);
+		return intercalate("", [stringForMatch(eli,psum) | eli <- el]);
 	} else if (scalar(string(s)) := e) {
 		return s;
 	} else {
@@ -1383,10 +1420,11 @@ public str stringForMatch(Expr e) {
 	}
 }
 
-public str stringForMatch(expr(Expr e)) = stringForMatch(e);
-public str stringForMatch(name(name(str s))) = s;
+public str stringForMatch(expr(Expr e), PluginSummary psum) = stringForMatch(e,psum);
+public str stringForMatch(name(name(str s)), PluginSummary psum) = s;
 
 alias HookUses = rel[loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity];
+alias HookUsesWithPlugin = rel[str pluginName, loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity];
 
 public HookUses resolveHooks(str pluginName) {
 	pt = loadPluginBinary(pluginName);
@@ -1402,20 +1440,20 @@ public HookUses resolveHooks(str pluginName) {
 			println("Resolving against version <maxVersion> of WordPress");
 			
 			// Build name models for each of the hooks defined in WordPress
-			rel[NameOrExpr hookName, loc at, NameModel model] wpActionModels = { < hn, at, nameModel(hn) > | < hn, at > <- wpsum.providedActionHooks };
-			rel[NameOrExpr hookName, loc at, NameModel model] wpFilterModels = { < hn, at, nameModel(hn) > | < hn, at > <- wpsum.providedFilterHooks };
+			rel[NameOrExpr hookName, loc at, NameModel model] wpActionModels = { < hn, at, nameModel(hn,wpsum) > | < hn, at > <- wpsum.providedActionHooks };
+			rel[NameOrExpr hookName, loc at, NameModel model] wpFilterModels = { < hn, at, nameModel(hn,wpsum) > | < hn, at > <- wpsum.providedFilterHooks };
 	
 			// Build name models for each of the hooks defined in the plugin itself
-			rel[NameOrExpr hookName, loc at, NameModel model] actionModels = { < hn, at, nameModel(hn) > | < hn, at > <- psum.providedActionHooks };
-			rel[NameOrExpr hookName, loc at, NameModel model] filterModels = { < hn, at, nameModel(hn) > | < hn, at > <- psum.providedFilterHooks };
+			rel[NameOrExpr hookName, loc at, NameModel model] actionModels = { < hn, at, nameModel(hn,psum) > | < hn, at > <- psum.providedActionHooks };
+			rel[NameOrExpr hookName, loc at, NameModel model] filterModels = { < hn, at, nameModel(hn,psum) > | < hn, at > <- psum.providedFilterHooks };
 	
 			// Create subsets of the above where we have exact name matches, that way we only fall back on regular
 			// expression matching in cases where we define the def or use dynamically (note, here we are making
 			// an ASSUMPTION that, in these cases, this is the intended semantics).
-			rel[str hookName, loc at] wpActionsJustNames = { < s, at > | < name(name(str s)), at > <- wpsum.providedActionHooks };
-			rel[str hookName, loc at] wpFiltersJustNames = { < s, at > | < name(name(str s)), at > <- wpsum.providedFilterHooks };
-			rel[str hookName, loc at] actionsJustNames = { < s, at > | < name(name(str s)), at > <- psum.providedActionHooks };
-			rel[str hookName, loc at] filtersJustNames = { < s, at > | < name(name(str s)), at > <- psum.providedFilterHooks };
+			rel[str hookName, loc at] wpActionsJustNames = { < s, at > | < _, at, [ literalPart(str s) ] > <- wpActionModels };
+			rel[str hookName, loc at] wpFiltersJustNames = { < s, at > | < _, at, [ literalPart(str s) ] > <- wpFilterModels };
+			rel[str hookName, loc at] actionsJustNames = { < s, at > | < _, at, [ literalPart(str s) ] > <- actionModels };
+			rel[str hookName, loc at] filtersJustNames = { < s, at > | < _, at, [ literalPart(str s) ] > <- filterModels };
 			
 			println("Computed <size(wpActionModels)> for wordpress actions");
 			println("Computed <size(wpFilterModels)> for wordpress filters");
@@ -1431,99 +1469,99 @@ public HookUses resolveHooks(str pluginName) {
 			// Now, using these models, compute which of the actual uses match these models
 			HookUses localFilterMatches = { };
 			for ( < hnUse, useloc, _, reg > <- psum.filters ) {
-				bool doCheck = true;
-				if (name(name(str s)) := hnUse) {
-					for ( < s, defloc > <- filtersJustNames ) {
-						localFilterMatches = localFilterMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
-						doCheck = false;
-					}
-				}
-				if (doCheck) {
-					useString = stringForMatch(hnUse);
+				//bool doCheck = true;
+				//if (name(name(str s)) := hnUse) {
+				//	for ( < s, defloc > <- filtersJustNames ) {
+				//		localFilterMatches = localFilterMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
+				//		doCheck = false;
+				//	}
+				//}
+				//if (doCheck) {
+					useString = stringForMatch(hnUse,psum);
 					for ( < hnDef, defloc, nm > <- filterModels) {
 						try {
 							if (rexpMatch(useString, regexps[nm])) {
-								localFilterMatches = localFilterMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm) >;
+								localFilterMatches = localFilterMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm,useString) >;
 							}
 						} catch v : {
 							println("Bad regexp <regexps[nm]> caused by bug in source, skipping");
 						}
 					}
-				}
+				//}
 			}
 			println("Local filter matches: <size(localFilterMatches)>");
 	
 			HookUses localActionMatches = { };
 			for ( < hnUse, useloc, _, reg > <- psum.actions ) {
-				bool doCheck = true;
-				if (name(name(str s)) := hnUse) {
-					for ( < s, defloc > <- actionsJustNames ) {
-						localActionMatches = localActionMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
-						doCheck = false;
-					}
-				}
-				if (doCheck) {
-					useString = stringForMatch(hnUse);
+				//bool doCheck = true;
+				//if (name(name(str s)) := hnUse) {
+				//	for ( < s, defloc > <- actionsJustNames ) {
+				//		localActionMatches = localActionMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
+				//		doCheck = false;
+				//	}
+				//}
+				//if (doCheck) {
+					useString = stringForMatch(hnUse,psum);
 					for ( < hnDef, defloc, nm > <- actionModels) {
 						try {
 							if (rexpMatch(useString, regexps[nm])) {
-								localActionMatches = localActionMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm) >;
+								localActionMatches = localActionMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm,useString) >;
 							}
 						} catch v : {
 							println("Bad regexp <regexps[nm]> caused by bug in source, skipping");
 						}
 					}
-				}	
+				//}	
 			}
 			println("Local action matches: <size(localActionMatches)>");
 	
 			HookUses wpFilterMatches = { };
 			for ( < hnUse, useloc, _, reg > <- psum.filters ) {
-				bool doCheck = true;
-				if (name(name(str s)) := hnUse) {
-					for ( < s, defloc > <- wpFiltersJustNames ) {
-						wpFilterMatches = wpFilterMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
-						doCheck = false;
-					}
-				}
-				if (doCheck) {
-					useString = stringForMatch(hnUse);
+				//bool doCheck = true;
+				//if (name(name(str s)) := hnUse) {
+				//	for ( < s, defloc > <- wpFiltersJustNames ) {
+				//		wpFilterMatches = wpFilterMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
+				//		doCheck = false;
+				//	}
+				//}
+				//if (doCheck) {
+					useString = stringForMatch(hnUse,psum);
 					for ( < hnDef, defloc, nm > <- wpFilterModels) {
 						//println("Going to check against <regexps[nm]>");
 						try {
 							if (rexpMatch(useString, regexps[nm])) {
-								wpFilterMatches = wpFilterMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm) >;
+								wpFilterMatches = wpFilterMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm,useString) >;
 							}
 						} catch v : {
 							println("Bad regexp <regexps[nm]> caused by bug in source, skipping");
 						}
 					}	
-				}
+				//}
 			}
 			println("WordPress filter matches: <size(wpFilterMatches)>");
 	
 			HookUses wpActionMatches = { };
 			for ( < hnUse, useloc, _, reg > <- psum.actions ) {
-				bool doCheck = true;
-				if (name(name(str s)) := hnUse) {
-					for ( < s, defloc > <- wpActionsJustNames ) {
-						wpActionMatches = wpActionMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
-						doCheck = false;
-					}
-				}
-				if (doCheck) {
-					useString = stringForMatch(hnUse);
+				//bool doCheck = true;
+				//if (name(name(str s)) := hnUse) {
+				//	for ( < s, defloc > <- wpActionsJustNames ) {
+				//		wpActionMatches = wpActionMatches + < useloc, hnUse, defloc, name(name(s)), reg, 1000 >;
+				//		doCheck = false;
+				//	}
+				//}
+				//if (doCheck) {
+					useString = stringForMatch(hnUse,psum);
 					for ( < hnDef, defloc, nm > <- wpActionModels) {
 						//println("Going to check against <regexps[nm]>");
 						try {
 							if (rexpMatch(useString, regexps[nm])) {
-								wpActionMatches = wpActionMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm) >;
+								wpActionMatches = wpActionMatches + < useloc, hnUse, defloc, hnDef, reg, specificity(nm,useString) >;
 							}
 						} catch v : {
 							println("Bad regexp <regexps[nm]> caused by bug in source, skipping");
 						}
 					}	
-				}
+				//}
 			}
 			println("WordPress action matches: <size(wpActionMatches)>");
 			
@@ -1572,12 +1610,28 @@ public void resolveHooks(bool overwrite = true) {
 }
 
 @doc{Gives back a master relation of all uses across all plugins}
-public HookUses combineUses() {
-	HookUses res = { };
+public HookUsesWithPlugin combineUses() {
+	HookUsesWithPlugin res = { };
     pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
     for (l <- pluginDirs, exists(getPluginBinLoc(l.file)), exists(infoBin+"<l.file>-hook-uses.bin")) {
-		hu = readBinaryValueFile(#HookUses, infoBin+"<l.file>-hook-uses.bin");
-		res = res + hu;
+		HookUses hu = readBinaryValueFile(#HookUses, infoBin+"<l.file>-hook-uses.bin");
+		res = res + { < l.file, uat, u, dat, d, r, s > | < uat, u, dat, d, r, s > <- hu, s > 3 }; 
+	}
+	return res;
+}
+
+alias HookUsesForCounts = rel[str pluginName, loc usedAt, loc defAt, NameOrExpr def, int specificity];
+
+@doc{Gives back a master relation of all uses across all plugins}
+public HookUsesForCounts combineUsesForCounts() {
+	HookUsesForCounts res = { };
+	int processed = 0;
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file)), exists(infoBin+"<l.file>-hook-uses.bin")) {
+		HookUses hu = readBinaryValueFile(#HookUses, infoBin+"<l.file>-hook-uses.bin");
+		res = res + { < l.file, uat, dat, d, s > | < uat, u, dat, d, r, s > <- hu }; 
+    	processed += 1;
+    	if ((processed % 100) == 0) println("Processed <processed>...");
 	}
 	return res;
 }
@@ -1833,11 +1887,9 @@ alias HookUsesResolved = rel[loc usedAt, NameOrExpr use, loc defAt, NameOrExpr d
 
 public bool insideLoc(loc at, loc container) {
 	return 
-		container.file == at.file && 
-		container.begin.line <= at.begin.line &&
-		container.begin.column <= at.begin.column &&
-		container.end.line >= at.end.line &&
-		container.end.column >= at.end.column;
+		container.file == at.file &&
+		container.offset <= at.offset &&
+		(container.offset + container.length) >= (at.offset + at.length);
 }
 
 public HookUsesResolved resolveCallbacks(str pluginName) {
@@ -2303,3 +2355,215 @@ public lrel[int,str,loc]  queryPluginIndex(str queryTerm, str version) {
 	return [ < i, pp(imap[i]), imap[i]@at > | i <- ids ]; 
 }
 
+public void staticDynamicCountsInWP(str v) {
+	wpsum = loadWordpressPluginSummary(v);
+	staticFilters = [ e | < e, _ > <- wpsum.providedFilterHooks, name(name(_)) := e ];
+	dynamicFilters = [ e | < e, _ > <- wpsum.providedFilterHooks, expr(_) := e ];
+	staticActions = [ e | < e, _ > <- wpsum.providedActionHooks, name(name(_)) := e ];
+	dynamicActions = [ e | < e, _ > <- wpsum.providedActionHooks, expr(_) := e ];
+	
+	println("WordPress <v> defines <size(staticFilters)> static filters");
+	println("WordPress <v> defines <size(dynamicFilters)> dynamic filters");
+	println("WordPress <v> defines <size(staticActions)> static actions");
+	println("WordPress <v> defines <size(dynamicActions)> dynamic actions");
+}
+
+public void staticDynamicCountsInPlugins() {
+	staticFilterCount = 0;
+	dynamicFilterCount = 0;
+	staticActionCount = 0;
+	dynamicActionCount = 0;
+	
+	pluginCount = 0;
+	
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, exists(pluginInfoBin + "<l.file>-summary.bin")) {
+    	psum = loadPluginSummary(l.file);
+    	pluginCount += 1;
+    		
+		staticFilterCount += size([ e | < e, _, _, _ > <- psum.filters, name(name(_)) := e ]);
+		dynamicFilterCount += size([ e | < e, _, _, _ > <- psum.filters, expr(_) := e ]);
+		staticActionCount += size([ e | < e, _, _, _ > <- psum.actions, name(name(_)) := e ]);
+		dynamicActionCount += size([ e | < e, _, _, _ > <- psum.actions, expr(_) := e ]);
+	}
+
+	println("The corpus registers <staticFilterCount> static filter handlers across <pluginCount> plugins");
+	println("The corpus registers <dynamicFilterCount> dynamic filter handlers across <pluginCount> plugins");
+	println("The corpus registers <staticActionCount> static action handlers across <pluginCount> plugins");
+	println("The corpus registers <dynamicActionCount> dynamic action handlers across <pluginCount> plugins");
+}
+
+alias HookUsesForDist = rel[str pluginName, NameOrExpr hookName, NameOrExpr handlerName, loc handlerLoc];
+
+@doc{Get stats on how many hooks are used by plugins, in general}
+public HookUsesForDist combineUsesForPluginDist(bool justWordpressHooks=true) {
+	HookUsesForDist uses = { }; 
+	int processed = 0;
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    
+    set[str] wpfiles = {};
+    if (justWordpressHooks) {
+    	for (v <- sortedVersions()) {
+    		wpfiles = wpfiles + { l.path | l <- loadBinary("WordPress",v) };
+    	}
+    }
+    
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file)), exists(infoBin+"<l.file>-hook-uses.bin")) {
+		HookUses hu = readBinaryValueFile(#HookUses, infoBin+"<l.file>-hook-uses.bin");
+		if (!justWordpressHooks) {
+			uses = uses + { < l.file, d, u, uat > | < uat, u, dat, d, r, s > <- hu, s > 1 };
+		} else {
+			uses = uses + { < l.file, d, u, uat > | < uat, u, dat, d, r, s > <- hu, s > 1, dat.path in wpfiles };
+		}
+    	processed += 1;
+    	if ((processed % 100) == 0) println("Processed <processed>...");
+	}
+	return uses;
+}
+
+@doc{Reduce these stats down into a map of numbers for the distribution, this is number of hooks used by each plugin}
+public map[int,int] computeDistForHookUses(HookUsesForDist hud) {
+	perPluginCounts =  ( p : size(hud[p]<0>) | p <- hud<0> );
+	
+	map[int,int] res = ( );
+	for (pn <- perPluginCounts) {
+		if (perPluginCounts[pn] in res) {
+			res[perPluginCounts[pn]] += 1;
+		} else {
+			res[perPluginCounts[pn]] = 1;
+		}
+	}
+	
+	return res;
+}
+
+// alias HookUsesForDist = rel[str pluginName, NameOrExpr hookName, NameOrExpr handlerName, loc handlerLoc];
+
+@doc{Similar to the above, but gives the number of uses of each extension point}
+public map[str,int] computeDistForMostUsedHooks(HookUsesForDist hud) {
+	pluginsPerHook = { < pp(h), p > | < h, p > <- invert(hud<0,1>) };
+	perHookCounts =  ( h : size(pluginsPerHook[h]) | h <- pluginsPerHook<0> );
+	return perHookCounts;
+}
+
+public lrel[str,int] sortMostUsed(map[str,int] mostUsed) {
+	return reverse(sort(toList(mostUsed), bool(tuple[str s1, int i1] t1, tuple[str s2, int i2] t2) { return t1.i1 < t2.i2; }));
+}
+
+public set[str] getUnused(map[str,int] mostUsed) {
+	map[str,bool] allHooks = ( );
+	// Get a set of all hooks from 4.0 on
+	for (v <- sortedVersions(), v == "4.3.1") {
+		wpsum = loadWordpressPluginSummary(v);
+		allHooks = allHooks + 
+			( pp(h) : true  | <h,_> <- wpsum.providedActionHooks, name(name(_)) := h ) + 
+			( pp(h) : false | <h,_> <- wpsum.providedActionHooks, name(name(_)) !:= h ) + 
+			( pp(h) : true  | <h,_> <- wpsum.providedFilterHooks, name(name(_)) := h ) +
+			( pp(h) : false | <h,_> <- wpsum.providedFilterHooks, name(name(_)) !:= h );
+	}
+	
+	println("Size before removal: <size(allHooks<0>)>");
+	allHooks = domainX(allHooks,mostUsed<0>);
+	println("Total unused: <size(allHooks<0>)>");
+	println("Static unused: <size([h | h <- allHooks, allHooks[h]])>");
+	println("Dynamic unused: <size([h | h <- allHooks, !allHooks[h]])>");
+	
+	return allHooks<0>;
+}
+
+public set[str] getUnusedOriginal(map[str,int] mostUsed) {
+	set[str] allHooks = { };
+	// Get a set of all hooks from 4.0 on
+	for (v <- sortedVersions(), v == "4.3.1") {
+		wpsum = loadWordpressPluginSummary(v);
+		allHooks = allHooks + 
+			{ pp(h) | <h,_> <- wpsum.providedActionHooks } + 
+			{ pp(h) | <h,_> <- wpsum.providedFilterHooks };
+	}
+	
+	println("Size before removal: <size(allHooks)>");
+	allHooks = allHooks - mostUsed<0>;
+	println("Total unused: <size(allHooks)>");
+	
+	return allHooks;
+}
+
+@doc{Similar to the above, but get the plugin names instead.}
+public map[int,set[str]] computeDistForHookUsesWithNames(HookUsesForDist hud) {
+	map[str,int] perPluginCounts = ( p : 0 | p <- hud<0> );
+	for (<pn,hn,fn,fl> <- hud) {
+		perPluginCounts[pn] += 1;
+	}
+	
+	map[int,set[str]] res = ( );
+	for (pn <- perPluginCounts) {
+		if (perPluginCounts[pn] in res) {
+			res[perPluginCounts[pn]] = res[perPluginCounts[pn]] + { pn };
+		} else {
+			res[perPluginCounts[pn]] = { pn };
+		}
+	}
+	
+	return res;
+}
+
+private str makeSimpleCoords(map[int,int] inputs, str mark="", str markExtra="", str legend="") {
+	return "\\addplot<if(size(mark)>0){>[mark=<mark><if(size(markExtra)>0){>,<markExtra><}>]<}> coordinates {
+		   '<intercalate(" ",[ "(<i>,<inputs[i]>)" | i <- sort(toList(inputs<0>))])>
+		   '};<if(size(legend)>0){>
+		   '\\addlegendentry{<legend>}<}>";
+}
+
+private str makeSimpleCoords(lrel[int,int] inputs, str mark="", str markExtra="", str legend="") {
+	return "\\addplot<if(size(mark)>0){>[mark=<mark><if(size(markExtra)>0){>,<markExtra><}>]<}> coordinates {
+		   '<intercalate(" ",[ "(<i>,<j>)" | < i, j > <- inputs ])>
+		   '};<if(size(legend)>0){>
+		   '\\addlegendentry{<legend>}<}>";
+}
+
+public str pluginDistChart(map[int hookCount, int plugins] dist, str title="Hook Use in Plugins, by Hook Count", str label="fig:PCount", str markExtra="mark phase=1,mark repeat=5") {
+	list[str] coordinateBlocks = [ makeSimpleCoords(dist,mark="x") ];
+
+	str res = "\\begin{figure*}
+			  '\\centering
+			  '\\begin{tikzpicture}
+			  '\\begin{semilogyaxis}[width=\\textwidth,height=.25\\textheight,xlabel=Hook Count,ylabel=Plugin Count (log),xmin=1,ymin=0,xmax=<max(dist<0>)+5>,ymax=<max(dist<1>)+5>,legend style={at={(0,1)},anchor=north west},x tick label style={rotate=90,anchor=east},log ticks with fixed point]
+			  '<for (cb <- coordinateBlocks) {> <cb> <}>
+			  '\\end{semilogyaxis}
+			  '\\end{tikzpicture}
+			  '\\caption{<title>.\\label{<label>}} 
+			  '\\end{figure*}
+			  ";
+	return res;	
+}
+
+public str makePluginDistChart(map[int,int] dist = ( )) {
+	if (size(dist) == 0) {
+		dist = computeDistForHookUses(combineUsesForPluginDist());
+	}
+	return pluginDistChart(dist);
+}
+
+public str hookDistChart(lrel[int,int] dist, str title="Hook Popularity, by Plugin Count", str label="fig:HCount", str markExtra="mark phase=1,mark repeat=20") {
+	list[str] coordinateBlocks = [ makeSimpleCoords(dist,mark="x",markExtra=markExtra) ];
+
+	str res = "\\begin{figure*}
+			  '\\centering
+			  '\\begin{tikzpicture}
+			  '\\begin{semilogyaxis}[width=\\textwidth,height=.25\\textheight,xlabel=Hook Ranking (Least to Most Popular),ylabel=Plugin Count (log),xmin=0,ymin=0,xmax=<max(dist<0>)+5>,ymax=<max(dist<1>)+5>,legend style={at={(0,1)},anchor=north west},x tick label style={rotate=90,anchor=east},log ticks with fixed point]
+			  '<for (cb <- coordinateBlocks) {> <cb> <}>
+			  '\\end{semilogyaxis}
+			  '\\end{tikzpicture}
+			  '\\caption{<title>.\\label{<label>}} 
+			  '\\end{figure*}
+			  ";
+	return res;	
+}
+
+public str makeHookDistChart(map[str,int] mostUsed) {
+	sorted = sortMostUsed(mostUsed);
+	unused = getUnused(mostUsed);
+	list[int] usedCounts = reverse([ n | < _, n > <- sorted ]); // + [ 0 | _ <- unused ];
+	lrel[int,int] dist = [ < idx, usedCounts[idx] > | idx <- index(usedCounts) ]; 
+	return hookDistChart(dist);
+}
