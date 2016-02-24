@@ -1873,13 +1873,13 @@ public void sampleQueries() {
 // alias HookUses = rel[loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity];
 
 data HookUseTarget 
-	= functionTarget(str fname, loc at)
+	= functionTarget(str pluginName, str fname, loc at)
+	| potentialFunctionTarget(str pluginName, str fname, loc at)
 	| unknownFunctionTarget(str fname) 
-	| methodTarget(str cname, str mname, loc at)
-	| potentialMethodTarget(str cname, str mname, loc at) 
-	| staticMethodTarget(str cname, str mname, loc at)
+	| methodTarget(str pluginName, str cname, str mname, loc at)
+	| potentialMethodTarget(str pluginName, str cname, str mname, loc at) 
+	| staticMethodTarget(str pluginName, str cname, str mname, loc at)
 	| unknownMethodTarget(str mname) 
-	| unknownTarget()
 	| unresolvedTarget()
 	;
 
@@ -1899,69 +1899,106 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 	wpsum = (psum.pInfo is pluginInfo && just(maxVersion) := psum.pInfo.testedUpTo && wordpressPluginSummaryExists(maxVersion)) ? loadWordpressPluginSummary(maxVersion) : loadWordpressPluginSummary("4.3.1"); 
 
 	hu = readBinaryValueFile(#HookUses, infoBin+"<pluginName>-hook-uses.bin");
-	for (< loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity > <- hu) {
+	for (< loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int sp > <- hu) {
 		if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(scalar(string(fn)),_),_*]) := reg) {
 			// These are the cases for where the call target is given as a string.
-			if (fn in psum.functions<0>) {
-				// In this case, the target is an actual function provided by the plugin
-				res = res + { < usedAt, use, defAt, def, reg, specificity, functionTarget(fn,at) > | < fn,at> <- psum.functions };
-			} else if (fn in wpsum.functions<0>) {
-				// In this case, the target in an actual function provided by WordPress
-				res = res + { < usedAt, use, defAt, def, reg, specificity, functionTarget(fn,at) > | < fn,at> <- wpsum.functions };			
+			if (fn in psum.functions<0> || fn in wpsum.functions<0>) {
+				// In this case, the target is an actual function provided by the plugin or by WordPress
+				res = res + { < usedAt, use, defAt, def, reg, 99, functionTarget(pluginName,fn,at) > | < fn,at> <- (psum.functions + wpsum.functions) };
 			} else if (contains(fn,"::")) {
 				// Here the target is a static method on a class, given as ClassName::MethodName
-				pieces = split(fn,"::");
+				pieces = split("::",fn);
 				methodName = pieces[-1];
-				classPieces = split(intercalate("::",pieces[..-1]),"\\\\");
+				classPieces = split("\\",intercalate("::",pieces[..-1]));
 				className = classPieces[-1];
 
 				possibleMethods = { < className, methodName, at > | < className, methodName, at, _ > <- (psum.methods + wpsum.methods) };
 
 				if (size(possibleMethods) > 0) {
-					res = res + { < usedAt, use, defAt, def, reg, specificity, staticMethodTarget(cname, mname, at) > | < className, methodName, at > <- possibleMethods };
+					res = res + { < usedAt, use, defAt, def, reg, 99, staticMethodTarget(pluginName,className, methodName, at) > | < className, methodName, at > <- possibleMethods };
 				} else {
-					res = res + < usedAt, use, defAt, def, reg, specificity, unknownMethodTarget(methodName) >;
+					res = res + < usedAt, use, defAt, def, reg, 0, unknownMethodTarget(methodName) >;
 				}
-			} else if (contains(fn,"\\\\")) {
+			} else if (contains(fn,"\\")) {
 				// Here the target is a function given with the namespace (which technically isn't supported by WordPress)
-				functionPieces = split(fn,"\\\\");
+				functionPieces = split("\\", fn);
 				functionName = functionPieces[-1];
-				if (functionName in psum.functions<0>) {
-					res = res + { < usedAt, use, defAt, def, reg, specificity, functionTarget(functionName,at) > | < functionName,at> <- psum.functions };
-				} else if (functionName in wpsum.functions<0>) {
-					res = res + { < usedAt, use, defAt, def, reg, specificity, functionTarget(functionName,at) > | < functionName,at> <- wpsum.functions };
-				}				
+				if (functionName in psum.functions<0> || functionName in wpsum.functions<0>) {
+					res = res + { < usedAt, use, defAt, def, reg, 99, functionTarget(pluginName,functionName,at) > | < functionName,at> <- (psum.functions + wpsum.functions) };
+				} else {
+					res = res + < usedAt, use, defAt, def, reg, 0, unknownFunctionTarget(fn) >;
+				}			
 			} else {
 				// If we don't identify the function based on those categories, this is an unknown function
-				res = res + < usedAt, use, defAt, def, reg, specificity, unknownFunctionTarget(fn) >;
+				res = res + < usedAt, use, defAt, def, reg, 0, unknownFunctionTarget(fn) >;
 			}
-		} else if (h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,var(name(name("this"))),_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
-			// This is a method call on $this
-			containerClasses = { cname | < cname, at > <- psum.classes, insideLoc(defAt,at) };
+		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,var(name(name("this"))),_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
+			// This is a method call on $this, with the method name given as a string literal
+			containerClasses = { cname | < cname, at > <- (wpsum.classes + psum.classes), insideLoc(defAt,at) || insideLoc(usedAt,at) };
 			possibleMethods = { < cname, mn, at > | cname <- containerClasses, < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
 			if (size(possibleMethods) > 0) {
-				res = res + { < usedAt, use, defAt, def, reg, specificity, methodTarget(cname, mname, at) > | < cname, mname, at > <- possibleMethods };
+				res = res + { < usedAt, use, defAt, def, reg, 99, methodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods };
 			} else {
-				res = res + < usedAt, use, defAt, def, reg, specificity, unknownMethodTarget(mn) >;
+				res = res + < usedAt, use, defAt, def, reg, 0, unknownMethodTarget(mn) >;
 			}
-		} else if (h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,Expr e,_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
-			// This is a method call on some expression, since we don't have types we do a probable match
-			possibleMethods = { < cname, mn, at > | < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
+		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,var(name(name("this"))),_),arrayElement(_,e,_)]),_),_*]) := reg) {
+			// This is a method call on $this, with the method name given as an expression
+			containerClasses = { cname | < cname, at > <- (wpsum.classes + psum.classes), insideLoc(defAt,at) || insideLoc(usedAt,at) };
+			methodNameModel = nameModel(e,psum);
+			methodRegexp = regexpForNameModel(methodNameModel);
+			possibleMethods = { < cname, mn, at > | cname <- containerClasses, < cname, mn, at, _ > <- (psum.methods + wpsum.methods), rexpMatch(mn, methodRegexp) };
 			if (size(possibleMethods) > 0) {
-				res = res + { < usedAt, use, defAt, def, reg, specificity, potentialMethodTarget(cname, mname, at) > | < cname, mname, at > <- possibleMethods };
+				res = res + { < usedAt, use, defAt, def, reg, specificity(methodNameModel, "somename"), methodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods };
 			} else {
-				res = res + < usedAt, use, defAt, def, reg, specificity, unknownMethodTarget(mn) >;
+				res = res + < usedAt, use, defAt, def, reg, 0, unknownMethodTarget(pp(e)) >;
 			}
-		} else if (h:call(name(name(_)),[actualParameter(scalar(string(_)),_),actualParameter(array([arrayElement(_,scalar(string(cn)),_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
+		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,scalar(string(cn)),_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
 			// This is a static method call, given instead as array elements, e.g., array("ClassName","MethodName")
 			possibleMethods = { < cn, mn, at > | < cn, mn, at, _ > <- (psum.methods + wpsum.methods) };
 			if (size(possibleMethods) > 0) {
-				res = res + { < usedAt, use, defAt, def, reg, specificity, staticMethodTarget(cname, mname, at) > | < cname, mname, at > <- possibleMethods };
+				res = res + { < usedAt, use, defAt, def, reg, 99, staticMethodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods };
 			} else {
-				res = res + < usedAt, use, defAt, def, reg, specificity, unknownMethodTarget(mn) >;
+				res = res + < usedAt, use, defAt, def, reg, 0, unknownMethodTarget(mn) >;
 			}
+		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,scalar(string(cn)),_),arrayElement(_,e,_)]),_),_*]) := reg) {
+			// This is a static method call, given instead as array elements, but with the second element an expression
+			possibleMethods = { < cn, mn, at > | < cn, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			methodNameModel = nameModel(e,psum);
+			methodRegexp = regexpForNameModel(methodNameModel);
+			if (size(possibleMethods) > 0) {
+				res = res + { < usedAt, use, defAt, def, reg, specificity(methodNameModel, "somename"), staticMethodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods, rexpMatch(mname, methodRegexp) };
+			} else {
+				res = res + < usedAt, use, defAt, def, reg, 0, unknownMethodTarget(pp(e)) >;
+			}
+		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,Expr e,_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
+			// This is a method call on some expression, since we don't have types we do a probable match
+			possibleMethods = { < cname, mn, at > | < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			if (size(possibleMethods) > 0) {
+				res = res + { < usedAt, use, defAt, def, reg, 99, potentialMethodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods };
+			} else {
+				res = res + < usedAt, use, defAt, def, reg, 0, unknownMethodTarget(mn) >;
+			}
+		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,Expr e,_),arrayElement(_,e,_)]),_),_*]) := reg) {
+			// This is a method call on some expression, since we don't have types we do a probable match
+			possibleMethods = { < cname, mn, at > | < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			methodNameModel = nameModel(e,psum);
+			methodRegexp = regexpForNameModel(methodNameModel);
+			if (size(possibleMethods) > 0) {
+				res = res + { < usedAt, use, defAt, def, reg, specificity(methodNameModel, "somename"), potentialMethodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods, rexpMatch(mname, methodRegexp) };
+			} else {
+				res = res + < usedAt, use, defAt, def, reg, 0, unknownMethodTarget(pp(e)) >;
+			}
+		//} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(e,_),_*]) := reg) {
+		//	functionNameModel = nameModel(e,psum);
+		//	functionAsString = pp(e);
+		//	functionRegexp = regexpForNameModel(functionNameModel);
+		//	if (contains(functionAsString,"\\") || contains(functionAsString,"::")) {
+		//		res = res + < usedAt, use, defAt, def, reg, 0, unknownFunctionTarget(functionAsString) >;
+		//	} else {
+		//		res = res + { < usedAt, use, defAt, def, reg, specificity(functionNameModel, "somename"), potentialFunctionTarget(fname, at) > | < fname, at > <- (psum.functions + wpsum.functions), rexpMatch(fname, functionRegexp) };
+		//	}
 		} else {
-			res = res + < usedAt, use, defAt, def, reg, specificity, unresolvedTarget() >;
+			res = res + < usedAt, use, defAt, def, reg, 0, unresolvedTarget() >;
 		}
 	}
 	return res;
@@ -2355,6 +2392,28 @@ public lrel[int,str,loc]  queryPluginIndex(str queryTerm, str version) {
 	return [ < i, pp(imap[i]), imap[i]@at > | i <- ids ]; 
 }
 
+public lrel[int,str,loc] searchForAction(str queryTerm, str version="4.3.1") {
+	return queryPluginIndex("type:action <queryTerm>", version);
+}
+
+public lrel[int,str,loc] searchForFilter(str queryTerm, str version="4.3.1") {
+	return queryPluginIndex("type:filter <queryTerm>", version);
+}
+
+public lrel[int,str,loc] searchForHookName(str hookname, bool partial=true, str version="4.3.1") {
+	if (partial) {
+		return queryPluginIndex("hookparts:<hookname>", version);
+	} else {
+		return queryPluginIndex("hook:<hookname>", version);
+	}
+}
+
+public void displaySearchResults(lrel[int,str,loc] res) {
+	for (<id,hook,at> <- res) {
+		println("<id>: <hook> at location <at>");
+	}
+}
+
 public void staticDynamicCountsInWP(str v) {
 	wpsum = loadWordpressPluginSummary(v);
 	staticFilters = [ e | < e, _ > <- wpsum.providedFilterHooks, name(name(_)) := e ];
@@ -2566,4 +2625,103 @@ public str makeHookDistChart(map[str,int] mostUsed) {
 	list[int] usedCounts = reverse([ n | < _, n > <- sorted ]); // + [ 0 | _ <- unused ];
 	lrel[int,int] dist = [ < idx, usedCounts[idx] > | idx <- index(usedCounts) ]; 
 	return hookDistChart(dist);
+}
+
+public str mostUsedTable(lrel[str,int] mostUsed, int cutoff) {
+	wpsum = loadWordpressPluginSummary("4.3.1");
+	filterNames = { pp(e) | e <- wpsum.providedFilterHooks<0> };
+	actionNames = { pp(e) | e <- wpsum.providedActionHooks<0> };
+	topN = mostUsed[0..cutoff];
+	
+	str fa(str s) {
+		if (s in filterNames && s in actionNames) {
+			return "B";
+		} else if (s in filterNames) {
+			return "F";
+		} else if (s in actionNames) {
+			return "A";
+		} else {
+			return "N";
+		}
+	}
+	
+	str lines = intercalate("\n",["<s> & & <i> & & <fa(s)> \\\\" | <s,i> <- topN]);
+	
+	str tableContents = 
+	"\\begin{table}
+	'\\begin{center}
+	'\\caption{Most Popular WordPress Hooks.\\label{tbl:popular}}
+	'\\ra{1.2}
+	'\\begin{tabular}{@{}lcrcl@{}} \\toprule
+	'Hook & \\phantom{aaa} & Usage Count & \\phantom{bbb} & Type \\\\ \\midrule
+	'<lines>
+	'\\bottomrule
+	'\\end{tabular}
+	'\\end{center}
+	'The type is either A (Action) or F (Filter).
+	'\\end{table}
+	";
+	
+	return tableContents;
+}
+
+// alias HookUsesWithPlugin = rel[str pluginName, loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity];
+// alias HookUsesResolved = rel[loc usedAt, NameOrExpr use, loc defAt, NameOrExpr def, Expr reg, int specificity, HookUseTarget target];
+
+//data HookUseTarget 
+//	= functionTarget(str pluginName, str fname, loc at)
+//	| potentialFunctionTarget(str pluginName, str fname, loc at)
+//	| unknownFunctionTarget(str fname) 
+//	| methodTarget(str pluginName, str cname, str mname, loc at)
+//	| potentialMethodTarget(str pluginName, str cname, str mname, loc at) 
+//	| staticMethodTarget(str pluginName, str cname, str mname, loc at)
+//	| unknownMethodTarget(str mname) 
+//	| unresolvedTarget()
+//	;
+
+private int targetQuality(HookUseTarget t) = 2 when (t is functionTarget) || (t is methodTarget) || (t is staticMethodTarget);
+private int targetQuality(HookUseTarget t) = 1 when (t is potentialFunctionTarget) || (t is potentialMethodTarget);
+private default int targetQuality(HookUseTarget t) = 0;
+
+public lrel[str pn, HookUseTarget target] findBestImplementationsForId(str v, int id) {
+	return findBestImplementationsForId(v, id, combineUses());
+}
+
+public lrel[str pn, HookUseTarget target] findBestImplementationsForId(str v, int id, HookUsesWithPlugin hup) {
+	imap = loadIndexMap(v);
+	hookexp = imap[id];
+	
+	// The expression naming the handler
+	searchExp = expr(hookexp);
+	if (scalar(string(hn)) := hookexp) {
+		searchExp = name(name(hn));
+	}
+	
+	// Narrow this down to just the links for this hook
+	narrowed = { < pn, uat, u, s > | < pn, uat, u, dat, searchExp, r, s > <- hup };
+	
+	// Now, use this to link to the actual handler implementations
+	rel[str pn, loc usedAt, NameOrExpr use, int specificity, HookUseTarget target] res = { };
+	for (pn <- narrowed<0>) {
+		res = res + { < pn, uat, u, s, t > | <uat, u, _, searchExp, _, s, t > <- resolveCallbacks(pn) };
+	}
+	
+	// Sort these implementations by the popularity of the plugin that contains them
+	dc = readPluginDownloadCounts();
+	lrel[str pn, loc usedAt, NameOrExpr use, int specificity, HookUseTarget target] sorted = [ ];
+	
+	bool sortfun(tuple[str pn, loc usedAt, NameOrExpr use, int specificity, HookUseTarget target] t1, tuple[str pn, loc usedAt, NameOrExpr use, int specificity, HookUseTarget target] t2) {
+		t1downloads = (t1.pn in dc) ? dc[t1.pn] : 0;
+		t2downloads = (t2.pn in dc) ? dc[t2.pn] : 0;
+		t1quality = targetQuality(t1.target);
+		t2quality = targetQuality(t2.target);
+		
+		if (t1.specificity != t2.specificity) return t1.specificity < t2.specificity;
+		if (t1quality != t2quality) return t1quality < t2quality;
+		
+		return t1downloads < t2downloads;
+	}
+	
+	sorted = reverse(sort(toList(res), sortfun));
+	return sorted<0,4>;
 }
