@@ -6,10 +6,21 @@ import lang::php::util::Corpus;
 import lang::php::util::Utils;
 import lang::php::util::Config;
 import lang::php::pp::PrettyPrinter;
-import lang::php::textsearch::Lucene;
-import lang::php::experiments::plugins::CommentSyntax;
 import lang::php::analysis::evaluators::AlgebraicSimplification;
 import lang::php::analysis::evaluators::SimulateCalls;
+import lang::php::analysis::includes::IncludesInfo;
+import lang::php::analysis::includes::QuickResolve;
+
+import lang::php::experiments::plugins::Summary;
+import lang::php::experiments::plugins::Conflicts;
+import lang::php::experiments::plugins::CommentSyntax;
+import lang::php::experiments::plugins::Shortcodes;
+import lang::php::experiments::plugins::MetaData;
+import lang::php::experiments::plugins::Options;
+import lang::php::experiments::plugins::Hooks;
+import lang::php::experiments::plugins::Abstractions;
+import lang::php::experiments::plugins::Locations;
+import lang::php::experiments::plugins::TextSearch;
 
 import Set;
 import Relation;
@@ -22,14 +33,6 @@ import Map;
 import DateTime;
 import ParseTree;
 import Traversal;
-
-private loc pluginDir = baseLoc + "plugins";
-private loc pluginBin = baseLoc + "serialized/plugins";
-private loc infoBin = baseLoc + "serialized/hook-info";
-private loc pluginInfoBin = baseLoc + "serialized/plugin-info";
-private loc pluginAnalysisInfoBin = baseLoc + "serialized/plugin-analysis-info";
-private loc sqlDir = baseLoc + "generated/plugin-sql";
-private loc wpAsPluginBin = baseLoc + "serialized/plugin-wp-info";
 
 @doc{Build serialized ASTs for the given plugin.}
 public void buildPluginBinary(str s, loc l, bool overwrite = true, set[str] skip = { }) {
@@ -64,12 +67,25 @@ public void buildPluginBinaries(bool overwrite = true, set[str] skip = { }) {
     }
 }
 
+@doc{This is only needed if these were built originally when systems where just aliases to maps}
 public void convertPluginBinaries() {
     pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
-    for (l <- pluginDirs, l.file > "wp-survey-and-poll") {
+    for (l <- pluginDirs) {
     	println("Converting binary for <l.file>");
     	loc binLoc = pluginBin + "<l.file>.pt";
-    	writeBinaryValueFile(binLoc, convertSystem(readBinaryValueFile(#value, binLoc)), compression=false);
+    	writeBinaryValueFile(binLoc, convertSystem(readBinaryValueFile(#value, binLoc), l), compression=false);
+    }
+}
+
+@doc{This is only needed if these were built originally when systems where just aliases to maps}
+public void convertToNamedSystem() {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs) {
+    	println("Converting binary for <l.file>");
+    	loc binLoc = pluginBin + "<l.file>.pt";
+    	pt = readBinaryValueFile(#System, binLoc);
+    	pt = namedSystem(l.file, pt.baseLoc, pt.files);
+    	writeBinaryValueFile(binLoc, pt, compression=false);
     }
 }
 
@@ -93,12 +109,6 @@ public System loadPluginBinary(str s) {
     }
 }
 
-@doc{Option type for strings}
-data MaybeStr = nothing() | just(str val);
-
-@doc{High-level info for the plugin, stored in the plugin readme}
-data PluginInfo = noInfo() | pluginInfo(MaybeStr pluginName, MaybeStr testedUpTo, MaybeStr stableTag, MaybeStr requiresAtLeast);
-
 @doc{Extract high-level info on the plugin from the readme file}
 public PluginInfo readPluginInfo(str s) {
     loc srcLoc = getPluginSrcLoc(s);
@@ -115,152 +125,6 @@ public PluginInfo readPluginInfo(str s) {
     }
 }
 
-@doc{A relation from function names to the location of the function declaration}
-alias FRel = rel[str fname, loc at];
-@doc{A relation from class names to the location of the class declaration}
-alias CRel = rel[str cname, loc at];
-@doc{A relation from class x method names to the location of the method declaration}
-alias MRel = rel[str cname, str mname, loc at, bool isPublic];
-@doc{The location of the hooks used inside the plugin}
-alias HRel = rel[NameOrExpr hookName, loc at, int priority, Expr regExpr];
-@doc{The location of the constants defined in the plugin}
-alias ConstRel = rel[str constName, loc at, Expr constExpr];
-@doc{The location of the class constants defined in the plugin}
-alias ClassConstRel = rel[str cname, str constName, loc at, Expr constExpr];
-@doc{The location of shortcode registrations}
-alias ShortcodeRel = rel[NameOrExpr scname, loc at];
-@doc{Locations of uses of add_option}
-alias OptionRel = rel[NameOrExpr optName, loc at];
-@doc{Locations of uses of add_post_meta}
-alias PostMetaRel = rel[NameOrExpr postMetaKey, loc at];
-@doc{Locations of uses of add_user_meta}
-alias UserMetaRel = rel[NameOrExpr userMetaKey, loc at];
-@doc{Locations of uses of add_comment_meta}
-alias CommentMetaRel = rel[NameOrExpr commentMetaKey, loc at];
-@doc{Locations of registered hooks}
-alias RHRel = rel[NameOrExpr hookName, loc at];
-
-@doc{The plugin summary, containing extracted information about the plugin.}
-data PluginSummary = summary(PluginInfo pInfo, FRel functions, CRel classes, MRel methods, HRel filters, HRel actions, ConstRel consts, ClassConstRel classConsts, ShortcodeRel shortcodes, OptionRel options, PostMetaRel postMetaKeys, UserMetaRel userMetaKeys, CommentMetaRel commentMetaKeys, RHRel providedActionHooks, RHRel providedFilterHooks);
-
-@doc{Extract the information on declared functions for the given system}
-FRel definedFunctions(System s) {
-    return { < fname, f@at > | /f:function(fname,_,_,_) := s };
-}
-
-@doc{Extract the information on declared classes for the given system}
-CRel definedClasses(System s) {
-    return { < cname, c@at > | /c:class(cname,_,_,_,members) := s };
-}
-
-@doc{Extract the information on declared methods for the given system}
-MRel definedMethods(System s) {
-    return { < cname, mname, m@at, (\public() in mods || !(\private() in mods || \protected() in mods)) > | /c:class(cname,_,_,_,members) := s, m:method(mname,mods,_,_,_) <- members };
-}
-
-@doc{Extract the information on declared constants for the given system}
-ConstRel definedConstants(System s) {
-	return { < cn, c@at, e > | /c:call(name(name("define")),[actualParameter(scalar(string(cn)),false),actualParameter(e,false)]) := s };
-}
-
-@doc{Extract the information on declared class constants for the given system}
-ClassConstRel definedClassConstants(System s) {
-	return { < cn, name, cc@at, ce > | /class(cn,_,_,_,cis) := s, constCI(consts) <- cis, cc:const(name,ce) <- consts };
-}
-
-@doc{Extract the information on declared WordPress shortcodes for the given system}
-ShortcodeRel definedShortcodes(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_shortcode")),[actualParameter(e,_),actualParameter(cb,_)]) := s };
-}
-
-@doc{Extract the information on declared admin options for WordPress plugins for the given system}
-OptionRel definedOptions(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_option")),[actualParameter(e,_),_*]) := s };
-}
-
-@doc{Extract the information on declared post metadata keys for the given system}
-PostMetaRel definedPostMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_post_meta")),[_,actualParameter(e,_),_*]) := s };
-}
-
-@doc{Extract the information on declared user metadata keys for the given system}
-UserMetaRel definedUserMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_user_meta")),[_,actualParameter(e,_),_*]) := s };
-}
-
-@doc{Extract the information on declared comment metadata keys for the given system}
-CommentMetaRel definedCommentMetaKeys(System s) {
-	return { < (scalar(string(sn)) := e) ? name(name(sn)) : expr(e), c@at > | /c:call(name(name("add_comment_meta")),[_,actualParameter(e,_),_*]) := s };
-}
-
-// TODO: Include file resolution won't work for plugins, that would have to be done over
-// specific combinations
-
-@doc{Extract the information on declared filters for the given system}
-HRel definedFilters(System s) {
-    HRel res = { };
-    
-    for (/c:call(name(name("add_filter")), plist) := s, size(plist) >= 2) {
-        if (actualParameter(te:scalar(string(tagname)),_) := plist[0]) {
-            if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
-                res = res + < name(name(tagname)), c@at, priority, c >;
-            } else {
-                res = res + < name(name(tagname)), c@at, 10, c >; // 10 is the default priority
-            }
-        } else if (actualParameter(te,_) := plist[0]) {
-			if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
-			    res = res + < expr(te), c@at, priority, c >;
-			} else {
-			    res = res + < expr(te), c@at, 10, c >; // 10 is the default priority
-			}
-		}
-    }
-    
-    return res;
-}
-
-@doc{Extract the information on declared actions for the given system}
-HRel definedActions(System s) {
-    HRel res = { };
-    
-    for (/c:call(name(name("add_action")), plist) := s, size(plist) >= 2) {
-        if (actualParameter(ae:scalar(string(actionName)),_) := plist[0]) {
-            if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
-                res = res + < name(name(actionName)), c@at, priority, c >;
-            } else {
-                res = res + < name(name(actionName)), c@at, 10, c >; // 10 is the default priority
-            }
-        } else if (actualParameter(ae,_) := plist[0]) {
-            if (size(plist) > 2 && actualParameter(scalar(integer(priority)),_) := plist[2]) {
-                res = res + < expr(ae), c@at, priority, c >;
-            } else {
-                res = res + < expr(ae), c@at, 10, c >; // 10 is the default priority
-            }
-        }
-    }
-    
-    return res;
-}
-
-@doc{Extract a relational summary of the given plugin, passed as a System}
-public PluginSummary extractPluginSummary(System pt) {
-	return summary(
-		noInfo(), 
-		definedFunctions(pt),
-		definedClasses(pt), 
-		definedMethods(pt), 
-		definedFilters(pt), 
-		definedActions(pt), 
-		definedConstants(pt), 
-		definedClassConstants(pt), 
-		definedShortcodes(pt), 
-		definedOptions(pt), 
-		definedPostMetaKeys(pt), 
-		definedUserMetaKeys(pt), 
-		definedCommentMetaKeys(pt), 
-		findSimpleActionHooksWithLocs(pt) + findDerivedActionHooksWithLocs(pt), 
-		findSimpleFilterHooksWithLocs(pt) + findDerivedFilterHooksWithLocs(pt));
-}
 
 @doc{Extract a relational summary of the given plugin from a pre-parsed plugin binary}
 public void extractPluginSummary(str pluginName) {
@@ -296,141 +160,6 @@ public void extractPluginSummary(bool overwrite = true) {
 			println("Already extracted info for plugin: <l.file>");
 		}
     }
-}
-
-@doc{Find action hooks with computed names defined in the given system}
-RHRel findDerivedActionHooksWithLocs(System sys) = 
-	{ < expr(e), f@at > | /f:call(name(name("do_action")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } +
-	{ < expr(e), f@at > | /f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
-
-@doc{Find action hooks with literal names defined in the given system}
-RHRel findSimpleActionHooksWithLocs(System sys) =
-	{ < name(name(e)), f@at > | /f:call(name(name("do_action")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
-	{ < name(name(e)), f@at > | /f:call(name(name("do_action_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
-
-@doc{Find filter hooks with computed names defined in the given system}
-RHRel findDerivedFilterHooksWithLocs(System sys) = 
-	{ < expr(e), f@at > | /f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } +
-	{ < expr(e), f@at > | /f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
-
-@doc{Find filter hooks with literal names defined in the given system}
-RHRel findSimpleFilterHooksWithLocs(System sys) =
-	{ < name(name(e)), f@at > | /f:call(name(name("apply_filters")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
-	{ < name(name(e)), f@at > | /f:call(name(name("apply_filters_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
-
-@doc{Find action hooks with computed names defined in the given system}
-set[Expr] findDerivedActionHooks(System sys) = 
-	{ e | /f:call(name(name("do_action")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } +
-	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
-
-@doc{Find action hooks with literal names defined in the given system}
-set[str] findSimpleActionHooks(System sys) =
-	{ e | /f:call(name(name("do_action")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
-	{ e | /f:call(name(name("do_action_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
-	
-@doc{Find all derived action hooks defined across all versions of WordPress}
-rel[str,Expr] findDerivedActionHooks() {
-	return { < v, e > | v <- getVersions("WordPress"), pt := loadBinary("WordPress",v), e <- findDerivedActionHooks(pt) };
-}
-
-@doc{Find all simple action hooks defined across all versions of WordPress}
-rel[str,str] findSimpleActionHooks() {
-	return { < v, e > | v <- getVersions("WordPress"), pt := loadBinary("WordPress",v), e <- findSimpleActionHooks(pt) };
-}
-
-@doc{Find filter hooks with computed names defined in the given system}
-set[Expr] findDerivedFilterHooks(System sys) = 
-	{ e | /f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e } + 
-	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := sys, scalar(string(_)) !:= e };
-
-@doc{Find filter hooks with literal names defined in the given system}
-set[str] findSimpleFilterHooks(System sys) =
-	{ e | /f:call(name(name("apply_filters")),[actualParameter(scalar(string(e)),_),_*]) := sys } +
-	{ e | /f:call(name(name("apply_filters_ref_array")),[actualParameter(scalar(string(e)),_),_*]) := sys };
-	
-@doc{Find all derived filter hooks defined across all versions of WordPress}
-rel[str,Expr] findDerivedFilterHooks() {
-	return { < v, e > | v <- getVersions("WordPress"), pt := loadBinary("WordPress",v), e <- findDerivedFilterHooks(pt) };
-}
-
-@doc{Find all simple filter hooks defined across all versions of WordPress}
-rel[str,str] findSimpleFilterHooks() {
-	return { < v, e > | v <- getVersions("WordPress"), pt := loadBinary("WordPress",v), e <- findSimpleFilterHooks(pt) };
-}
-
-@doc{Show changes in defined hooks across WordPress versions}
-void showSimpleHookChanges(rel[str,str] simpleHooks) {
-	sv = getSortedVersions("WordPress");
-	for (idx <- index(sv)) {
-		if (idx == 0) {
-			println("Version <sv[idx]> has <size(simpleHooks[sv[idx]])> hooks");
-		} else {
-			newHooks = simpleHooks[sv[idx]] - simpleHooks[sv[idx-1]];
-			removedHooks = simpleHooks[sv[idx-1]] - simpleHooks[sv[idx]];
-			println("Version <sv[idx]> has <size(simpleHooks[sv[idx]])> hooks");
-			if (size(newHooks) > 0) {
-				println("\tNew Hooks are <newHooks>");
-			}
-			if (size(removedHooks) > 0) {
-				println("\tRemoved Hooks are <removedHooks>");
-			}
-		}
-	}
-}
-
-@doc{Extract information about all defined hooks from all versions of WordPress}
-void extractHookInfo() {
-	println("Extracting and writing simple filter-related hooks");
-	saveSimpleFilterHooks(findSimpleFilterHooks());
-
-	println("Extracting and writing simple action-related hooks");
-	saveSimpleActionHooks(findSimpleActionHooks());
-
-	println("Extracting and writing derived filter-related hooks");
-	saveDerivedFilterHooks(findDerivedFilterHooks());
-
-	println("Extracting and writing derived filter-related hooks");
-	saveDerivedActionHooks(findDerivedActionHooks());
-}
-
-@doc{Write information on simple filter hooks defined in all versions of WordPress}
-void saveSimpleFilterHooks(rel[str,str] simpleHooks) {
-	writeBinaryValueFile(infoBin + "simpleFilterHooks.bin", simpleHooks);		
-}
-
-@doc{Write information on simple action hooks defined in all versions of WordPress}
-void saveSimpleActionHooks(rel[str,str] simpleHooks) {
-	writeBinaryValueFile(infoBin + "simpleActionHooks.bin", simpleHooks);		
-}
-
-@doc{Write information on derived filter hooks defined in all versions of WordPress}
-void saveDerivedFilterHooks(rel[str,Expr] derivedHooks) {
-	writeBinaryValueFile(infoBin + "derivedFilterHooks.bin", derivedHooks);		
-}
-
-@doc{Write information on derived action hooks defined in all versions of WordPress}
-void saveDerivedActionHooks(rel[str,Expr] derivedHooks) {
-	writeBinaryValueFile(infoBin + "derivedActionHooks.bin", derivedHooks);		
-}
-
-@doc{Read information on simple filter hooks defined in all versions of WordPress}
-rel[str,str] loadSimpleFilterHooks() {
-	return readBinaryValueFile(#rel[str,str], infoBin + "simpleFilterHooks.bin");		
-}
-
-@doc{Read information on simple action hooks defined in all versions of WordPress}
-rel[str,str] loadSimpleActionHooks() {
-	return readBinaryValueFile(#rel[str,str], infoBin + "simpleActionHooks.bin");		
-}
-
-@doc{Read information on derived filter hooks defined in all versions of WordPress}
-rel[str,Expr] loadDerivedFilterHooks() {
-	return readBinaryValueFile(#rel[str,Expr], infoBin + "derivedFilterHooks.bin");		
-}
-
-@doc{Read information on derived action hooks defined in all versions of WordPress}
-rel[str,Expr] loadDerivedActionHooks() {
-	return readBinaryValueFile(#rel[str,Expr], infoBin + "derivedActionHooks.bin");		
 }
 
 @doc{Load the summary for the given plugin}
@@ -526,6 +255,18 @@ rel[str,NameOrExpr] pluginShortcodes(str pluginName) {
 rel[str,NameOrExpr] pluginShortcodes() {
 	list[loc] pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
 	return { < pn, sn > | l <- pluginDirs, exists(pluginInfoBin + "<l.file>-summary.bin"), < pn, sn > <- pluginShortcodes(l.file) }; 
+}
+
+@doc{Return the shortcodes defined in a given plugin, with locations.}
+rel[str,NameOrExpr,loc] pluginShortcodesWithLocations(str pluginName) {
+    psum = loadPluginSummary(pluginName);
+	return { < pluginName, e, at > | < e, at > <- psum.shortcodes };
+}
+
+@doc{Return the shortcodes defined in all plugins in the corpus with the plugin name as first projection}
+rel[str,NameOrExpr,loc] pluginShortcodesWithLocations() {
+	list[loc] pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+	return { < pn, sn, at > | l <- pluginDirs, exists(pluginInfoBin + "<l.file>-summary.bin"), < pn, sn, at > <- pluginShortcodesWithLocations(l.file) }; 
 }
 
 @doc{Return the options defined in a given plugin.}
@@ -712,297 +453,6 @@ map[NameOrExpr,set[str]] definingPluginsForMetaKeys(rel[str,NameOrExpr] keys) {
 	return res;
 }
 
-@doc{Get the names of any functions defined multiple times}
-set[str] multiplyDefinedFunctions(map[str,set[str]] definers) = { f | f <- definers, size(definers[f]) > 1 };
-
-@doc{Get the names of any classes defined multiple times}
-set[str] multiplyDefinedClasses(map[str,set[str]] definers) = { c | c <- definers, size(definers[c]) > 1 };
-
-@doc{Get the names of any methods defined multiple times}
-rel[str,str] multiplyDefinedMethods(map[tuple[str,str],set[str]] definers) = { cm | cm <- definers, size(definers[cm]) > 1 };
-
-@doc{Get the names of any constants defined multiple times}
-set[str] multiplyDefinedConstants(map[str,set[str]] definers) = { f | f <- definers, size(definers[f]) > 1 };
-
-@doc{Get the names of any shortcodes defined multiple times}
-set[NameOrExpr] multiplyDefinedShortcodes(map[NameOrExpr,set[str]] definers) = { cm | cm <- definers, size(definers[cm]) > 1 };
-
-@doc{Get the names of any options defined multiple times}
-set[NameOrExpr] multiplyDefinedOptions(map[NameOrExpr,set[str]] definers) = { cm | cm <- definers, size(definers[cm]) > 1 };
-
-@doc{Get the names of any keys defined multiple times}
-set[NameOrExpr] multiplyDefinedKeys(map[NameOrExpr,set[str]] definers) = { cm | cm <- definers, size(definers[cm]) > 1 };
-
-set[NameOrExpr] multiplyDefinedPostMetaKeys() {
-	return multiplyDefinedKeys(definingPluginsForMetaKeys(pluginPostMetaKeys()));
-}
-
-set[NameOrExpr] multiplyDefinedUserMetaKeys() {
-	return multiplyDefinedKeys(definingPluginsForMetaKeys(pluginUserMetaKeys()));
-}
-
-set[NameOrExpr] multiplyDefinedCommentMetaKeys() {
-	return multiplyDefinedKeys(definingPluginsForMetaKeys(pluginCommentMetaKeys()));
-}
-
-data FunctionInfo = functionInfo(int totalFunctions, int inPlugins, int conflictingFunctions, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
-
-data ClassInfo = classInfo(int totalClasses, int inPlugins, int conflictingClasses, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
-
-data MethodInfo = methodInfo(int totalMethods, int inPlugins, int conflictingMethods, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
-
-data ConstInfo = constInfo(int totalConsts, int conflictingConsts, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
-
-data ClassConstInfo = classConstInfo(int totalClassConsts, int conflictingClassConsts, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
-
-data MetaKeyInfo = metaKeyInfo(int totalOccurrences, int totalKeysDefined, int conflictingKeys, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
-
-data ShortcodeInfo = shortcodeInfo(int totalOccurrences, int totalShortcodesDefined, int conflictingShortcodes, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
-
-data OptionInfo = optionInfo(int totalOccurrences, int totalOptionsDefined, int conflictingOptions, int conflictingPlugins, int totalConflicts, int smallestSet, real medianSet, int biggestSet);
-
-real intListMedian(list[int] nums) {
-	if (size(nums) == 0) throw "Cannot use on empty list!";
-	
-	if (size(nums) % 2 == 0) {
-		idx2 = size(nums) / 2;
-		idx1 = idx2 - 1;
-		return toReal(nums[idx1] + nums[idx2]) / 2.0;
-	} else {
-		idx = (size(nums)-1)/2;
-		return toReal(nums[idx]);
-	}
-}
-
-FunctionInfo computeFunctionInfo(rel[str,str] functions) {
-	// Upper-case the functions, since they are actually case insensitive
-	functions = { < p, toUpperCase(f) > | < p, f > <- functions };
-	
-	// Next, compute the map for defining plugins
-	definingPlugins = definingPluginsForFunctions(functions);
-	
-	// Now, find out which of these are multiply defined
-	multiplyDefined = domainR(definingPlugins,multiplyDefinedFunctions(definingPlugins));
-	involvedPlugins = { p | f <- multiplyDefined, p <- multiplyDefined[f] };
-	
-	// How many conflicts are there? This is the sum of the sets in the multiply defined map
-	totalConflicts = size([pn | kn <- multiplyDefined, pn <- multiplyDefined[kn]]);
-	
-	// What is the smallest conflict set?
-	smallestSet = totalConflicts; // We know it's smaller than this...
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) < smallestSet) smallestSet = size(multiplyDefined[kn]);
-	
-	// What is the largest conflict set?
-	biggestSet = 0;
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) > biggestSet) biggestSet = size(multiplyDefined[kn]);
-	
-	// What is the median conflict set?
-	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
-	
-	return functionInfo(size(functions), size(functions<0>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
-}
-
-ClassInfo computeClassInfo(rel[str,str,str] methods) {
-	// Upper-case the classes and methods, since they are actually case insensitive
-	methods = { < p, toUpperCase(c), toUpperCase(m) > | < p, c, m > <- methods };
-
-	// Next, compute the map for defining plugins
-	definingPlugins = definingPluginsForClasses(methods);
-	
-	// Now, find out which of these are multiply defined
-	multiplyDefined = domainR(definingPlugins,multiplyDefinedClasses(definingPlugins));
-	involvedPlugins = { p | c <- multiplyDefined, p <- multiplyDefined[c] };
-	
-	// How many conflicts are there? This is the sum of the sets in the multiply defined map
-	totalConflicts = size([pn | kn <- multiplyDefined, pn <- multiplyDefined[kn]]);
-	
-	// What is the smallest conflict set?
-	smallestSet = totalConflicts; // We know it's smaller than this...
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) < smallestSet) smallestSet = size(multiplyDefined[kn]);
-	
-	// What is the largest conflict set?
-	biggestSet = 0;
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) > biggestSet) biggestSet = size(multiplyDefined[kn]);
-	
-	// What is the median conflict set?
-	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
-	
-	return classInfo(size(methods<0,1>), size(methods<0>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
-}
-
-MethodInfo computeMethodInfo(rel[str,str,str] methods) {
-	// Upper-case the classes and methods, since they are actually case insensitive
-	methods = { < p, toUpperCase(c), toUpperCase(m) > | < p, c, m > <- methods };
-
-	// Next, compute the map for defining plugins
-	definingPlugins = definingPluginsForMethods(methods);
-	
-	// Now, find out which of these are multiply defined
-	multiplyDefined = domainR(definingPlugins,multiplyDefinedMethods(definingPlugins));
-	involvedPlugins = { p | cm <- multiplyDefined, p <- multiplyDefined[cm] };
-	
-	// How many conflicts are there? This is the sum of the sets in the multiply defined map
-	totalConflicts = size([pn | kn <- multiplyDefined, pn <- multiplyDefined[kn]]);
-	
-	// What is the smallest conflict set?
-	smallestSet = totalConflicts; // We know it's smaller than this...
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) < smallestSet) smallestSet = size(multiplyDefined[kn]);
-	
-	// What is the largest conflict set?
-	biggestSet = 0;
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) > biggestSet) biggestSet = size(multiplyDefined[kn]);
-	
-	// What is the median conflict set?
-	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
-	
-	return methodInfo(size(methods), size(methods<0>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
-}
-
-ConstInfo computeConstantInfo(rel[str,str] consts) {
-	// Next, compute the map for defining plugins
-	definingPlugins = definingPluginsForConstants(consts);
-	
-	// Now, find out which of these are multiply defined
-	multiplyDefined = domainR(definingPlugins,multiplyDefinedConstants(definingPlugins));
-	involvedPlugins = { p | f <- multiplyDefined, p <- multiplyDefined[f] };
-	
-	// How many conflicts are there? This is the sum of the sets in the multiply defined map
-	totalConflicts = size([pn | kn <- multiplyDefined, pn <- multiplyDefined[kn]]);
-	
-	// What is the smallest conflict set?
-	smallestSet = totalConflicts; // We know it's smaller than this...
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) < smallestSet) smallestSet = size(multiplyDefined[kn]);
-	
-	// What is the largest conflict set?
-	biggestSet = 0;
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) > biggestSet) biggestSet = size(multiplyDefined[kn]);
-	
-	// What is the median conflict set?
-	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
-	
-	return constInfo(size(consts), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
-}
-
-ClassConstInfo computeClassConstantInfo(rel[str,str,str] cconsts) {
-	// Next, compute the map for defining plugins
-	definingPlugins = definingPluginsForClassConstants(cconsts);
-	
-	// Now, find out which of these are multiply defined
-	multiplyDefined = domainR(definingPlugins,multiplyDefinedMethods(definingPlugins));
-	involvedPlugins = { p | cm <- multiplyDefined, p <- multiplyDefined[cm] };
-	
-	// How many conflicts are there? This is the sum of the sets in the multiply defined map
-	totalConflicts = size([pn | kn <- multiplyDefined, pn <- multiplyDefined[kn]]);
-	
-	// What is the smallest conflict set?
-	smallestSet = totalConflicts; // We know it's smaller than this...
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) < smallestSet) smallestSet = size(multiplyDefined[kn]);
-	
-	// What is the largest conflict set?
-	biggestSet = 0;
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) > biggestSet) biggestSet = size(multiplyDefined[kn]);
-	
-	// What is the median conflict set?
-	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
-	
-	return classConstInfo(size(cconsts), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
-}
-
-MetaKeyInfo computeMetaKeyConflictInfo(rel[str,NameOrExpr] metaKeys) {
-	println("Given <size(metaKeys)> occurrences in <size(metaKeys<0>)> plugins");
-
-	// First, filter to just include those that are given as names, not as expressions
-	filteredKeys =  { < s, k > | < s, k > <- metaKeys, k is name };
-	
-	println("After filtering, there are <size(filteredKeys)> occurrences in <size(filteredKeys<0>)> plugins");
-
-	// Next, compute the map for defining plugins
-	definingPlugins = definingPluginsForMetaKeys(filteredKeys);
-	
-	// Now, find out which of these are multiply defined
-	multiplyDefined = domainR(definingPlugins,multiplyDefinedKeys(definingPlugins));
-	involvedPlugins = { p | cm <- multiplyDefined, p <- multiplyDefined[cm] };
-	
-	// How many conflicts are there? This is the sum of the sets in the multiply defined map
-	totalConflicts = size([pn | kn <- multiplyDefined, pn <- multiplyDefined[kn]]);
-	
-	// What is the smallest conflict set?
-	smallestSet = totalConflicts; // We know it's smaller than this...
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) < smallestSet) smallestSet = size(multiplyDefined[kn]);
-	
-	// What is the largest conflict set?
-	biggestSet = 0;
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) > biggestSet) biggestSet = size(multiplyDefined[kn]);
-	
-	// What is the median conflict set?
-	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
-	
-	return metaKeyInfo(size(metaKeys), size(filteredKeys<1>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
-}
-
-ShortcodeInfo computeShortcodeConflictInfo(rel[str,NameOrExpr] shortcodes) {
-	println("Given <size(shortcodes)> occurrences in <size(shortcodes<0>)> plugins");
-	
-	// First, filter to just include those that are given as names, not as expressions
-	filteredShortcodes =  { < s, k > | < s, k > <- shortcodes, k is name };
-	
-	println("After filtering, there are <size(filteredShortcodes)> occurrences in <size(filteredShortcodes<0>)> plugins");
-	
-	// Next, compute the map for defining plugins
-	definingPlugins = definingPluginsForShortcodes(filteredShortcodes);
-	
-	// Now, find out which of these are multiply defined
-	multiplyDefined = domainR(definingPlugins,multiplyDefinedShortcodes(definingPlugins));
-	involvedPlugins = { p | cm <- multiplyDefined, p <- multiplyDefined[cm] };
-	
-	// How many conflicts are there? This is the sum of the sets in the multiply defined map
-	totalConflicts = size([pn | kn <- multiplyDefined, pn <- multiplyDefined[kn]]);
-	
-	// What is the smallest conflict set?
-	smallestSet = totalConflicts; // We know it's smaller than this...
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) < smallestSet) smallestSet = size(multiplyDefined[kn]);
-	
-	// What is the largest conflict set?
-	biggestSet = 0;
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) > biggestSet) biggestSet = size(multiplyDefined[kn]);
-	
-	// What is the median conflict set?
-	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
-	
-	return shortcodeInfo(size(shortcodes), size(filteredShortcodes<1>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
-}
-
-OptionInfo computeOptionConflictInfo(rel[str,NameOrExpr] options) {
-	println("Given <size(options)> occurrences in <size(options<0>)> plugins");
-
-	// First, filter to just include those that are given as names, not as expressions
-	filteredOptions =  { < s, k > | < s, k > <- options, k is name };
-	
-	println("After filtering, there are <size(filteredOptions)> occurrences in <size(filteredOptions<0>)> plugins");
-	
-	// Next, compute the map for defining plugins
-	definingPlugins = definingPluginsForOptions(filteredOptions);
-	
-	// Now, find out which of these are multiply defined
-	multiplyDefined = domainR(definingPlugins,multiplyDefinedOptions(definingPlugins));
-	involvedPlugins = { p | cm <- multiplyDefined, p <- multiplyDefined[cm] };
-	
-	// How many conflicts are there? This is the sum of the sets in the multiply defined map
-	totalConflicts = size([pn | kn <- multiplyDefined, pn <- multiplyDefined[kn]]);
-	
-	// What is the smallest conflict set?
-	smallestSet = totalConflicts; // We know it's smaller than this...
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) < smallestSet) smallestSet = size(multiplyDefined[kn]);
-	
-	// What is the largest conflict set?
-	biggestSet = 0;
-	for (kn <- multiplyDefined, size(multiplyDefined[kn]) > biggestSet) biggestSet = size(multiplyDefined[kn]);
-	
-	// What is the median conflict set?
-	real medianSet = intListMedian(sort([ size(multiplyDefined[kn]) | kn <- multiplyDefined ]));
-	
-	return optionInfo(size(options), size(filteredOptions<1>), size(multiplyDefined<0>), size(involvedPlugins), totalConflicts, smallestSet, medianSet, biggestSet); 
-}
 
 @doc{For methods with multiple definitions, cluster these so we can see how many different versions exist and which plugins share the same versions}
 map[tuple[str,str],set[set[str]]] clusterMultiplyDefinedMethods(rel[str,str] mdMethods, map[tuple[str,str],set[str]] definers) {
@@ -1170,171 +620,7 @@ PluginSummary loadWordpressPluginSummary(str version) {
 
 bool wordpressPluginSummaryExists(str version) {
 	return exists(wpAsPluginBin + "wordpress-<version>-summary.bin");
-}
- 
-void findCollisionsWithWordPress() {
-	vs = getSortedVersions("WordPress");
-	vs40 = vs[indexOf(vs,"4.0")..];
-
-	pf = pluginFunctions();
-	pm = pluginMethods();
-	pc = pluginConstants();
-	pcc = pluginClassConstants();
-	ps = pluginShortcodes();
-	po = pluginOptions();
-	ppm = pluginPostMetaKeys();
-	pum = pluginUserMetaKeys();
-	pcm = pluginCommentMetaKeys();
-
-	dpf = definingPluginsForFunctions(pf);
-	dpc = definingPluginsForClasses(pm);
-	dpm = definingPluginsForMethods(pm);
-	dpconst = definingPluginsForConstants(pc);
-	dpcconst = definingPluginsForClassConstants(pcc);
-	dps = definingPluginsForShortcodes(ps);
-	dpo = definingPluginsForOptions(po);
-	dppm = definingPluginsForMetaKeys(ppm);	
-	dpum = definingPluginsForMetaKeys(pum);	
-	dpcm = definingPluginsForMetaKeys(pcm);	
-	
-	// Function collisions
-	for (v <- vs40) {
-		wps = readBinaryValueFile(#PluginSummary, wpAsPluginBin + "wordpress-<v>-summary.bin");
-		
-		wpf = { f | < f, _ > <- wps.functions };
-		wpm = { < c, m > | < c, m, _ > <- wps.methods };
-		wpc = wpm<0>;
-		wpconst = { c | < c, _ > <- wps.consts };
-		wpcconst = { < c, x > | < c, x, _ > <- wps.classConsts };
-		wpshort = { s | < s:name(name(si)), _ > <- wps.shortcodes };
-		wpo = { s | < s:name(name(si)), _ > <- wps.options };
-		wppm = { s | < s:name(name(si)), _ > <- wps.postMetaKeys };
-		wpum = { s | < s:name(name(si)), _ > <- wps.userMetaKeys };
-		wpcm = { s | < s:name(name(si)), _ > <- wps.commentMetaKeys };
-		
-		conflictFunctions = domainR(dpf,wpf);
-		conflictMethods = domainR(dpm,wpm);
-		conflictClasses = domainR(dpc,wpc);
-		conflictConsts = domainR(dpconst, wpconst);
-		conflictClassConsts = domainR(dpcconst, wpcconst);
-		conflictShortcodes = domainR(dps, wpshort);
-		conflictOptions = domainR(dpo, wpo);
-		conflictPostMeta = domainR(dppm, wppm);
-		conflictUserMeta = domainR(dpum, wpum);
-		conflictCommentMeta = domainR(dpcm, wpcm);
-
-		println("START <v>");
-		println("<v>: Found <size(conflictFunctions)> function conflicts with <size({p|k<-conflictFunctions,p<-conflictFunctions[k]})> plugins");
-		println("<v>: Found <size(conflictMethods)> method conflicts with <size({p|k<-conflictMethods,p<-conflictMethods[k]})> plugins");
-		println("<v>: Found <size(conflictClasses)> class conflicts with <size({p|k<-conflictClasses,p<-conflictClasses[k]})> plugins");
-		println("<v>: Found <size(conflictConsts)> const conflicts with <size({p|k<-conflictConsts,p<-conflictConsts[k]})> plugins");
-		println("<v>: Found <size(conflictClassConsts)> class const conflicts with <size({p|k<-conflictClassConsts,p<-conflictClassConsts[k]})> plugins");
-		println("<v>: Found <size(conflictShortcodes)> shortcode conflicts with <size({p|k<-conflictShortcodes,p<-conflictShortcodes[k]})> plugins");
-		println("<v>: Found <size(conflictOptions)> option conflicts with <size({p|k<-conflictOptions,p<-conflictOptions[k]})> plugins");
-		println("<v>: Found <size(conflictPostMeta)> post meta conflicts with <size({p|k<-conflictPostMeta,p<-conflictPostMeta[k]})> plugins");
-		println("<v>: Found <size(conflictUserMeta)> user meta conflicts with <size({p|k<-conflictUserMeta,p<-conflictUserMeta[k]})> plugins");
-		println("<v>: Found <size(conflictCommentMeta)> comment meta conflicts with <size({p|k<-conflictCommentMeta,p<-conflictCommentMeta[k]})> plugins");
-		println("END <v>"); println("");
-	} 
-}
-
-tuple[datetime s, datetime e] timeNameConflictDetection() {
-	dt1 = now();
-	computeClassInfo(pluginMethods());
-	computeMethodInfo(pluginMethods());
-	computeFunctionInfo(pluginFunctions());
-	computeConstantInfo(pluginConstants());
-	computeClassConstantInfo(pluginClassConstants());
-	dt2 = now();
-	return < dt1, dt2 >;
-}
-
-tuple[datetime s, datetime e] timeKeyConflictDetection() {
-	dt1 = now();
-	computeShortcodeConflictInfo(pluginShortcodes());
-	computeOptionConflictInfo(pluginOptions());
-	computeMetaKeyConflictInfo(pluginPostMetaKeys());
-	computeMetaKeyConflictInfo(pluginUserMetaKeys());
-	computeMetaKeyConflictInfo(pluginCommentMetaKeys());
-	dt2 = now();
-	return < dt1, dt2 >;
-}
-
-@doc{The conflict report, containing conflicts with a given plugin}
-data Conflicts = conflicts(PluginInfo pInfo, map[str,set[str]] functions, map[str,set[str]] classes, map[tuple[str,str],set[str]] methods, map[str,set[str]] filters, map[str,set[str]] actions, map[str,set[str]] consts, map[tuple[str,str],set[str]] classConsts, map[str,set[str]] shortcodes, map[str,set[str]] options, map[str,set[str]] postMetaKeys, map[str,set[str]] userMetaKeys, map[str,set[str]] commentMetaKeys);
-
-@doc{Find conflicts with the set of plugins in plugins.}
-Conflicts findConflicts(System sys, set[str] plugins) {
-	return findConflicts(extractPluginSummary(sys), plugins);
-}
-
-@doc{Find conflicts with the set of plugins in plugins.}
-Conflicts findConflicts(PluginSummary sysSummary, set[str] plugins) {
-	// TODO: For now, we are checking against every plugin, we need to filter this to allow
-	// for checks against user-defined subsets.
-	
-	// Get back entities defined in the plugins
-	pf = pluginFunctions();
-	pm = pluginMethods();
-	pc = pluginConstants();
-	pcc = pluginClassConstants();
-	ps = pluginShortcodes();
-	po = pluginOptions();
-	ppm = pluginPostMetaKeys();
-	pum = pluginUserMetaKeys();
-	pcm = pluginCommentMetaKeys();
-
-	// Put these info a form where we can easily map from entities to plugins that define them
-	dpf = definingPluginsForFunctions(pf);
-	dpc = definingPluginsForClasses(pm);
-	dpm = definingPluginsForMethods(pm);
-	dpconst = definingPluginsForConstants(pc);
-	dpcconst = definingPluginsForClassConstants(pcc);
-	dps = definingPluginsForShortcodes(ps);
-	dpo = definingPluginsForOptions(po);
-	dppm = definingPluginsForMetaKeys(ppm);	
-	dpum = definingPluginsForMetaKeys(pum);	
-	dpcm = definingPluginsForMetaKeys(pcm);	
-	
-	// Get back just the names of entities for the current plugin
-	wpf = { f | < f, _ > <- sysSummary.functions };
-	wpm = { < c, m > | < c, m, _ > <- sysSummary.methods };
-	wpc = wpm<0>;
-	wpconst = { c | < c, _ > <- sysSummary.consts };
-	wpcconst = { < c, x > | < c, x, _ > <- sysSummary.classConsts };
-	wpshort = { s | < s:name(name(si)), _ > <- sysSummary.shortcodes };
-	wpo = { s | < s:name(name(si)), _ > <- sysSummary.options };
-	wppm = { s | < s:name(name(si)), _ > <- sysSummary.postMetaKeys };
-	wpum = { s | < s:name(name(si)), _ > <- sysSummary.userMetaKeys };
-	wpcm = { s | < s:name(name(si)), _ > <- sysSummary.commentMetaKeys };
-	
-	// Restrict the domains of each entity map/relation to just include conflicting entities
-	conflictFunctions = domainR(dpf,wpf);
-	conflictMethods = domainR(dpm,wpm);
-	conflictClasses = domainR(dpc,wpc);
-	conflictConsts = domainR(dpconst, wpconst);
-	conflictClassConsts = domainR(dpcconst, wpcconst);
-	conflictShortcodes = domainR(dps, wpshort);
-	conflictOptions = domainR(dpo, wpo);
-	conflictPostMeta = domainR(dppm, wppm);
-	conflictUserMeta = domainR(dpum, wpum);
-	conflictCommentMeta = domainR(dpcm, wpcm);
-
-	println("CONFLICT REPORT");
-	println("Found <size(conflictFunctions)> function conflicts with <size({p|k<-conflictFunctions,p<-conflictFunctions[k]})> plugins");
-	println("Found <size(conflictMethods)> method conflicts with <size({p|k<-conflictMethods,p<-conflictMethods[k]})> plugins");
-	println("Found <size(conflictClasses)> class conflicts with <size({p|k<-conflictClasses,p<-conflictClasses[k]})> plugins");
-	println("Found <size(conflictConsts)> const conflicts with <size({p|k<-conflictConsts,p<-conflictConsts[k]})> plugins");
-	println("Found <size(conflictClassConsts)> class const conflicts with <size({p|k<-conflictClassConsts,p<-conflictClassConsts[k]})> plugins");
-	println("Found <size(conflictShortcodes)> shortcode conflicts with <size({p|k<-conflictShortcodes,p<-conflictShortcodes[k]})> plugins");
-	println("Found <size(conflictOptions)> option conflicts with <size({p|k<-conflictOptions,p<-conflictOptions[k]})> plugins");
-	println("Found <size(conflictPostMeta)> post meta conflicts with <size({p|k<-conflictPostMeta,p<-conflictPostMeta[k]})> plugins");
-	println("Found <size(conflictUserMeta)> user meta conflicts with <size({p|k<-conflictUserMeta,p<-conflictUserMeta[k]})> plugins");
-	println("Found <size(conflictCommentMeta)> comment meta conflicts with <size({p|k<-conflictCommentMeta,p<-conflictCommentMeta[k]})> plugins");
-	
-	// Return the summary of conflicts
-	return conflicts(conflictFunctions, conflictClasses, conflictMethods, conflictConsts, conflictClassConsts, conflictShortcodes, conflictOptions, conflictPostMeta, conflictUserMeta, conflictCommentMeta);
-}
+} 
 
 public data NamePart = literalPart(str s) | exprPart(Expr e);
 public alias NameModel = list[NamePart];
@@ -2014,406 +1300,6 @@ public HookUsesResolved resolveCallbacks() {
 	return res;
 }
 
-private loc indexBase = |file:///Users/mhills/PHPAnalysis/lucene|;
-private loc indexMaps = |file:///Users/mhills/PHPAnalysis/serialized/lucene-indexes|;
-
-public list[Line] getLines(Comment c) {
-	list[Line] matchLine(Lines ls) {
-		if (ls is singleLine) {
-			return [ ls.line ];
-		} else if (ls is multipleLines) {
-			return [ ls.line ] + matchLine(ls.lines);
-		} else {
-			println("We have a problem!");
-			throw "Problem!";
-		}
-	}
-	return matchLine(c.lines);
-}
-
-public str getTextFromTextLines(list[Line] ls) {
-	if (size(ls) > 0 && head(ls) is onlyLine) return "<head(ls).text>";
-	while (size(ls) > 0 && !(head(ls) is textLine)) ls = tail(ls);
-	list[Line] textLines = [ ];
-	while (size(ls) > 0 && head(ls) is textLine) { textLines += head(ls); ls = tail(ls); }
-	return intercalate(" ", [ "<l.text>" | l <- textLines ] );
-}
-
-public str getTextFromTaggedLines(list[Line] ls) {
-	if (size(ls) > 0 && head(ls) is onlyTaggedLine) return "<head(ls).text>";
-	while (size(ls) > 0 && !(head(ls) is taggedLine || head(ls) is justTaggedLine)) ls = tail(ls);
-	return intercalate(" ", [ "<l.text>" | l <- ls, l has text ] );
-}
-
-public map[str,str] buildCommentMap(Comment c, map[str,str] commentMap) {
-	commentLines = getLines(c);
-	text = getTextFromTextLines(commentLines);
-	tags = getTextFromTaggedLines(commentLines);
-	if (size(trim(text)) > 0) commentMap["text"] = trim(text);
-	if (size(trim(tags)) > 0) commentMap["tags"] = trim(tags);
-	return commentMap;
-}
-
-// Parsing isn't working well, it is generating ambiguities; for now,
-// just split on an "@" if we find one.
-public map[str,str] buildCommentMap(str c, map[str,str] commentMap, Expr e) {
-	commentMap["hook"] = pp(e);
-	commentMap["hookparts"] = intercalate(" ", [ p | p <- split("_",pp(e)), p != "wp", size(p) > 2]);
-	text = ""; tags = ""; c = trim(c);
-	firstAt = findFirst(c,"@");
-	if (firstAt > 0) {
-		text = c[0..firstAt];
-		tags = c[firstAt..];
-	} else if (firstAt == -1) {
-		text = c;
-	} else {
-		tags = c;
-	}
-	commentMap["text"] = text;
-	commentMap["tags"] = tags;
-	return commentMap;
-	//if (size(trim(c)) > 0) {
-	//	lastParsed = c;
-	//	return buildCommentMap(parse(#Comment,c), commentMap);
-	//} else {
-	//	return commentMap;
-	//}
-}
-
-public void buildPluginIndexes() {
-	for (v <- sortedWPVersionsWithPlugins()) {
-		println("Building index for WordPress <v>");
-		indexLoc = indexBase + "wordpress-<v>";
-		openIndex(indexLoc);
-
-		pt = normalizeComments(loadBinary("WordPress", v));
-		map[int,Expr] idMap = ( );
-		int id = 1;
-		
-		for (/f:call(name(name("do_action")),[actualParameter(e,_),_*]) := pt) {
-			if ( (f@phpdoc)? ) {
-				idMap[id] = e;
-				addDocument( buildCommentMap(f@phpdoc, ("id" : "<id>", "type" : "action"), e) );		
-			} else {
-				addDocument( buildCommentMap("", ("id" : "<id>", "type" : "action"), e) );
-			}
-			id += 1;
-		}
-
-		for (/f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := pt) {
-			if ( (f@phpdoc)? ) {
-				idMap[id] = e;
-				addDocument( buildCommentMap(f@phpdoc, ("id" : "<id>", "type" : "action"), e) );		
-			} else {
-				addDocument( buildCommentMap("", ("id" : "<id>", "type" : "action"), e) );
-			}
-			id += 1;
-		}
-
-		for (/f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := pt) {
-			if ( (f@phpdoc)? ) {
-				idMap[id] = e;
-				addDocument( buildCommentMap(f@phpdoc, ("id" : "<id>", "type" : "filter"), e) );		
-			} else {
-				addDocument( buildCommentMap("", ("id" : "<id>", "type" : "filter"), e) );
-			}
-			id += 1;
-		}
-
-		for (/f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := pt) {
-			if ( (f@phpdoc)? ) {
-				idMap[id] = e;
-				addDocument( buildCommentMap(f@phpdoc, ("id" : "<id>", "type" : "filter"), e) );		
-			} else {
-				addDocument( buildCommentMap("", ("id" : "<id>", "type" : "filter"), e) );
-			}
-			id += 1;
-		}
-		
-		closeIndex();
-		saveIndexMap(idMap,v);
-	}	
-}
-
-public void checkCommentParser() {
-	for (v <- sortedWPVersionsWithPlugins()) {
-		checkCommentParser(v);
-	}
-}
-
-public str lastParsed = "";
-
-public void checkCommentParser(str v) {
-	println("Parsing comments for WordPress <v>");
-
-	pt = normalizeComments(loadBinary("WordPress", v));
-	
-	for (/f:call(name(name("do_action")),[actualParameter(e,_),_*]) := pt) {
-		if ( (f@phpdoc)? ) {
-			println("Checking at location <f@at>");
-			lastParsed = f@phpdoc;
-			cpt = parse(#Comment,f@phpdoc);
-		}
-	}
-
-	for (/f:call(name(name("do_action_ref_array")),[actualParameter(e,_),_*]) := pt) {
-		if ( (f@phpdoc)? ) {
-			println("Checking at location <f@at>");
-			lastParsed = f@phpdoc;
-			cpt = parse(#Comment,f@phpdoc);
-		}
-	}
-
-	for (/f:call(name(name("apply_filters")),[actualParameter(e,_),_*]) := pt) {
-		if ( (f@phpdoc)? ) {
-			println("Checking at location <f@at>");
-			lastParsed = f@phpdoc;
-			cpt = parse(#Comment,f@phpdoc);
-		}
-	}
-
-	for (/f:call(name(name("apply_filters_ref_array")),[actualParameter(e,_),_*]) := pt) {
-		if ( (f@phpdoc)? ) {
-			println("Checking at location <f@at>");
-			lastParsed = f@phpdoc;
-			cpt = parse(#Comment,f@phpdoc);
-		}
-	}
-}
-
-public System normalizeComments(System sys) {
-	return ( l : normalizeComments(sys[l]) | l <- sys );
-}
-
-public list[Stmt] lastList = [ ];
-
-public Script normalizeComments(Script s) {
-	s = bottom-up visit(s) {
-		case f:call(name(name("do_action")), _) : {
-			if ( (f@phpdoc)? && size(trim(f@phpdoc)) > 0) {
-				; // this is fine
-			} else {
-				tc = getTraversalContext();
-				// Look back up through the context to find the containing statement, we may have the call as a standalone
-				// expression or it may be nested inside other expressions, inside strings, etc.
-				while (size(tc) >= 1 && Stmt stmt !:= head(tc)) tc = tail(tc);
-				if (size(tc) >= 1 && Stmt stmt := head(tc)) {
-					// If we found it, check to see if it has a doc comment. If so, use that one.
-					if ( (stmt@phpdoc)? && size(trim(stmt@phpdoc)) > 0) {
-						insert(f[@phpdoc=stmt@phpdoc]);
-					} else {
-						// If it doesn't, it may be the case that this statement is one of a list of statements.
-						// Check here to see if that is true.
-						tc = tail(tc);
-						if (size(tc) >= 1 && list[Stmt] slist := head(tc)) {
-							// If that is true, we want to look at the elements in the list before this one; if one
-							// of them has a doc comment, we will use that, assuming it is a reasonable distance
-							// away.
-							sIndex = indexOf(slist, stmt);
-							if (sIndex == -1) {
-								println("Error, statement not found but should be present");
-							} else {
-								if (sIndex > 0) {
-									if (f@at.begin.line == 291) {
-										lastList = slist;
-									}
-									listToSearch = [ li | li <- reverse(slist[0..sIndex]), li is inlineHTML, (li@phpdoc)? && (size(trim(li@phpdoc)) > 0) ];
-									if (size(listToSearch) > 0) {
-										foundIndex = indexOf(slist, head(listToSearch));
-										if (sIndex - foundIndex <= 2) {
-											// This is arbitrary, but is says that, if the first statement with a doc comment is
-											// one of the prior 3, use that. Normally it will be just one, but this gives us a
-											// bit of play without allowing truly distant comments to be used instead.
-											insert(f[@phpdoc=head(listToSearch)@phpdoc]);
-										}
-									}									
-								}
-							}
-						} else {
-							println("Unhandled case, statement was not in a list");
-						}
-					}
-				}
-			}
-		}
-
-		case f:call(name(name("do_action_ref_array")), _) : {
-			if ( (f@phpdoc)? && size(trim(f@phpdoc)) > 0) {
-				; // this is fine
-			} else {
-				tc = getTraversalContext();
-				// Look back up through the context to find the containing statement, we may have the call as a standalone
-				// expression or it may be nested inside other expressions, inside strings, etc.
-				while (size(tc) >= 1 && Stmt stmt !:= head(tc)) tc = tail(tc);
-				if (size(tc) >= 1 && Stmt stmt := head(tc)) {
-					// If we found it, check to see if it has a doc comment. If so, use that one.
-					if ( (stmt@phpdoc)? && size(trim(stmt@phpdoc)) > 0) {
-						insert(f[@phpdoc=stmt@phpdoc]);
-					} else {
-						// If it doesn't, it may be the case that this statement is one of a list of statements.
-						// Check here to see if that is true.
-						tc = tail(tc);
-						if (size(tc) >= 1 && list[Stmt] slist := head(tc)) {
-							// If that is true, we want to look at the elements in the list before this one; if one
-							// of them has a doc comment, we will use that, assuming it is a reasonable distance
-							// away.
-							sIndex = indexOf(slist, stmt);
-							if (sIndex == -1) {
-								println("Error, statement not found but should be present");
-							} else {
-								if (sIndex > 0) {
-									listToSearch = [ li | li <- reverse(slist[0..sIndex]), li is inlineHTML, (li@phpdoc)? && (size(trim(li@phpdoc)) > 0) ];
-									if (size(listToSearch) > 0) {
-										foundIndex = indexOf(slist, head(listToSearch));
-										if (sIndex - foundIndex <= 2) {
-											// This is arbitrary, but is says that, if the first statement with a doc comment is
-											// one of the prior 3, use that. Normally it will be just one, but this gives us a
-											// bit of play without allowing truly distant comments to be used instead.
-											insert(f[@phpdoc=head(listToSearch)@phpdoc]);
-										}
-									}									
-								}
-							}
-						} else {
-							println("Unhandled case, statement was not in a list");
-						}
-					}
-				}
-			}
-		}
-		
-		case f:call(name(name("apply_filters")), _)  : {
-			if ( (f@phpdoc)? && size(trim(f@phpdoc)) > 0) {
-				; // this is fine
-			} else {
-				tc = getTraversalContext();
-				// Look back up through the context to find the containing statement, we may have the call as a standalone
-				// expression or it may be nested inside other expressions, inside strings, etc.
-				while (size(tc) >= 1 && Stmt stmt !:= head(tc)) tc = tail(tc);
-				if (size(tc) >= 1 && Stmt stmt := head(tc)) {
-					// If we found it, check to see if it has a doc comment. If so, use that one.
-					if ( (stmt@phpdoc)? && size(trim(stmt@phpdoc)) > 0) {
-						insert(f[@phpdoc=stmt@phpdoc]);
-					} else {
-						// If it doesn't, it may be the case that this statement is one of a list of statements.
-						// Check here to see if that is true.
-						tc = tail(tc);
-						if (size(tc) >= 1 && list[Stmt] slist := head(tc)) {
-							// If that is true, we want to look at the elements in the list before this one; if one
-							// of them has a doc comment, we will use that, assuming it is a reasonable distance
-							// away.
-							sIndex = indexOf(slist, stmt);
-							if (sIndex == -1) {
-								println("Error, statement not found but should be present");
-							} else {
-								if (sIndex > 0) {
-									listToSearch = [ li | li <- reverse(slist[0..sIndex]), li is inlineHTML, (li@phpdoc)? && (size(trim(li@phpdoc)) > 0) ];
-									if (size(listToSearch) > 0) {
-										foundIndex = indexOf(slist, head(listToSearch));
-										if (sIndex - foundIndex <= 2) {
-											// This is arbitrary, but is says that, if the first statement with a doc comment is
-											// one of the prior 3, use that. Normally it will be just one, but this gives us a
-											// bit of play without allowing truly distant comments to be used instead.
-											insert(f[@phpdoc=head(listToSearch)@phpdoc]);
-										}
-									}									
-								}
-							}
-						} else {
-							println("Unhandled case, statement was not in a list");
-						}
-					}
-				}
-			}
-		}
-		
-		case f:call(name(name("apply_filters_ref_array")), _)  : {
-			if ( (f@phpdoc)? && size(trim(f@phpdoc)) > 0) {
-				; // this is fine
-			} else {
-				tc = getTraversalContext();
-				// Look back up through the context to find the containing statement, we may have the call as a standalone
-				// expression or it may be nested inside other expressions, inside strings, etc.
-				while (size(tc) >= 1 && Stmt stmt !:= head(tc)) tc = tail(tc);
-				if (size(tc) >= 1 && Stmt stmt := head(tc)) {
-					// If we found it, check to see if it has a doc comment. If so, use that one.
-					if ( (stmt@phpdoc)? && size(trim(stmt@phpdoc)) > 0) {
-						insert(f[@phpdoc=stmt@phpdoc]);
-					} else {
-						// If it doesn't, it may be the case that this statement is one of a list of statements.
-						// Check here to see if that is true.
-						tc = tail(tc);
-						if (size(tc) >= 1 && list[Stmt] slist := head(tc)) {
-							// If that is true, we want to look at the elements in the list before this one; if one
-							// of them has a doc comment, we will use that, assuming it is a reasonable distance
-							// away.
-							sIndex = indexOf(slist, stmt);
-							if (sIndex == -1) {
-								println("Error, statement not found but should be present");
-							} else {
-								if (sIndex > 0) {
-									listToSearch = [ li | li <- reverse(slist[0..sIndex]), li is inlineHTML, (li@phpdoc)? && (size(trim(li@phpdoc)) > 0) ];
-									if (size(listToSearch) > 0) {
-										foundIndex = indexOf(slist, head(listToSearch));
-										if (sIndex - foundIndex <= 2) {
-											// This is arbitrary, but is says that, if the first statement with a doc comment is
-											// one of the prior 3, use that. Normally it will be just one, but this gives us a
-											// bit of play without allowing truly distant comments to be used instead.
-											insert(f[@phpdoc=head(listToSearch)@phpdoc]);
-										}
-									}									
-								}
-							}
-						} else {
-							println("Unhandled case, statement was not in a list");
-						}
-					}
-				}
-			}
-		}
-	}
-	
-	return s;
-}
-
-public void saveIndexMap(map[int,Expr] imap, str version) {
-	writeBinaryValueFile(indexMaps + "wordpress-<version>.bin", imap);
-}
-
-public map[int,Expr] loadIndexMap(str version) {
-	return readBinaryValueFile(#map[int,Expr], indexMaps + "wordpress-<version>.bin");
-}
-
-public lrel[int,str,loc]  queryPluginIndex(str queryTerm, str version) {
-	indexLoc = indexBase + "wordpress-<version>";
-	prepareQueryEngine(indexLoc);
-	ids = [ toInt(i) | i <- runQuery(queryTerm) ];
-	imap = loadIndexMap(version);
-	return [ < i, pp(imap[i]), imap[i]@at > | i <- ids ]; 
-}
-
-public lrel[int,str,loc] searchForAction(str queryTerm, str version="4.3.1") {
-	return queryPluginIndex("type:action <queryTerm>", version);
-}
-
-public lrel[int,str,loc] searchForFilter(str queryTerm, str version="4.3.1") {
-	return queryPluginIndex("type:filter <queryTerm>", version);
-}
-
-public lrel[int,str,loc] searchForHookName(str hookname, bool partial=true, str version="4.3.1") {
-	if (partial) {
-		return queryPluginIndex("hookparts:<hookname>", version);
-	} else {
-		return queryPluginIndex("hook:<hookname>", version);
-	}
-}
-
-public void displaySearchResults(lrel[int,str,loc] res) {
-	for (<id,hook,at> <- res) {
-		println("<id>: <hook> at location <at>");
-	}
-}
-
 public void staticDynamicCountsInWP(str v) {
 	wpsum = loadWordpressPluginSummary(v);
 	staticFilters = [ e | < e, _ > <- wpsum.providedFilterHooks, name(name(_)) := e ];
@@ -2724,4 +1610,143 @@ public lrel[str pn, HookUseTarget target] findBestImplementationsForId(str v, in
 	
 	sorted = reverse(sort(toList(res), sortfun));
 	return sorted<0,4>;
+}
+
+public void buildIncludesInfoForPlugins() {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs) {
+		pt = loadPluginBinary(l.file);
+    	println("Building includes info for plugin <pt.name>");
+		buildIncludesInfo(pt);
+	}
+}
+
+public void buildIncludesInfoForWP() {
+	for (v <- getVersions("WordPress")) {
+		pt = loadBinary("WordPress", v);
+		println("Building includes info for WordPress version <v>");
+		buildIncludesInfo(pt);
+	}
+}
+
+@doc{The location of serialized quick resolve information}
+private loc infoLoc = baseLoc + "serialized/quickResolved";
+
+public void quickResolveWordpress() {
+	p = "WordPress";
+	for (v <- getVersions(p)) {
+		sys = loadBinary(p,v);
+		if (!includesInfoExists(p,v)) buildIncludesInfo(p,v,sys.baseLoc);
+		IncludesInfo iinfo = loadIncludesInfo(p, v);
+		rel[loc,loc,loc] res = { };
+		map[loc,Duration] timings = ( );
+		println("Resolving for <size(sys.files<0>)> files");
+		counter = 0;
+		for (l <- sys.files) {
+			dt1 = now();
+			qr = quickResolve(sys, iinfo, l, sys.baseLoc, libs = { });
+			dt2 = now();
+			res = res + { < l, ll, lr > | < ll, lr > <- qr };
+			counter += 1;
+			if (counter % 100 == 0) {
+				println("Resolved <counter> files");
+			}
+			timings[l] = (dt2 - dt1);
+		}
+		writeBinaryValueFile(infoLoc + "<p>-<v>-qr.bin", res);
+		writeBinaryValueFile(infoLoc + "<p>-<v>-qrtime.bin", timings);
+	}
+}
+
+public loc patchLoc(loc baseLoc, loc newBase, loc toPatch) {
+	// NOTE: We assume these have the same scheme, we should check that
+	toPatchTarget = toPatch.path[size(baseLoc.path)..];
+	return newBase + toPatchTarget;
+}
+
+public str patchLocString(loc baseLoc, loc newBase, str toPatch) {
+	// NOTE: We assume these have the same scheme, we should check that
+	toPatchTarget = toPatch[size(baseLoc.path)..];
+	return (newBase + toPatchTarget).path;
+}
+
+public void quickResolvePlugins() {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+    for (l <- pluginDirs, l.file > "wp-bible-embed") {
+    	println("Resolving for plugin <l.file>");
+		quickResolvePlugin(l.file);
+	}
+}
+
+public void findMissingIncludesInfo() {
+	pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+	for (l <- pluginDirs, !includesInfoExists(l.file)) {
+		println("<l.file>");
+	}
+}
+
+public int countPluginsWithIncludesInfo() {
+	pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
+	counter = 0;
+	for (l <- pluginDirs, includesInfoExists(l.file)) {
+		counter += 1;
+	}
+	return counter;
+}
+
+public void quickResolvePlugins2() {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l), !includesInfoExists(l.file) ]);
+    for (l <- pluginDirs) {
+    	println("Resolving for plugin <l.file>");
+		quickResolvePlugin(l.file);
+	}
+}
+
+public System relocateFiles(System sys, loc newBase) {
+	patched = sys[files = ( patchLoc(sys.baseLoc, newBase, l) : sys.files[l] | l <- sys.files)];
+	patched = visit(patched) {
+		case fc:fileConstant() => fc[@actualValue=patchLocString(sys.baseLoc, newBase, fc@actualValue)] when (fc@actualValue)?
+		
+		case dc:dirConstant() => dc[@actualValue=patchLocString(sys.baseLoc, newBase, dc@actualValue)] when (dc@actualValue)?
+	}
+	return patched;
+}
+
+public void quickResolvePlugin(str pluginName) {
+	sys = loadPluginBinary(pluginName);
+	psum = loadPluginSummary(pluginName);
+	
+	if (psum.pInfo is pluginInfo && just(maxVersion) := psum.pInfo.testedUpTo) {
+		if (binaryExists("WordPress",maxVersion)) {
+			// Now, "install" the plugin into WordPress (at least logically)
+			wpsys = loadBinary("WordPress", maxVersion);
+			patched = relocateFiles(sys, wpsys.baseLoc + "wp-content/plugins/<sys.name>/");
+			wpsysExtended = wpsys[files=wpsys.files + patched.files];
+			
+			buildIncludesInfo(wpsysExtended, overrideName=sys.name);
+			iinfo = loadIncludesInfo(sys.name);
+			
+			rel[loc,loc,loc] res = { };
+			map[loc,Duration] timings = ( );
+			println("Resolving for <size(wpsysExtended.files<0>)> files");
+			counter = 0;
+			for (l <- wpsysExtended.files) {
+				dt1 = now();
+				qr = quickResolve(wpsysExtended, iinfo, l, wpsysExtended.baseLoc, libs = { });
+				dt2 = now();
+				res = res + { < l, ll, lr > | < ll, lr > <- qr };
+				counter += 1;
+				if (counter % 100 == 0) {
+					println("Resolved <counter> files");
+				}
+				timings[l] = (dt2 - dt1);
+			}
+			writeBinaryValueFile(infoLoc + "<sys.name>-qr.bin", res);
+			writeBinaryValueFile(infoLoc + "<sys.name>-qrtime.bin", timings);			
+		} else {
+			println("WordPress version <maxVersion> does not exist");
+		}
+	} else {
+		println("Could not use plugin info for plugin <pluginName>");
+	}
 }
