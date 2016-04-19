@@ -21,6 +21,7 @@ import lang::php::experiments::plugins::Hooks;
 import lang::php::experiments::plugins::Abstractions;
 import lang::php::experiments::plugins::Locations;
 import lang::php::experiments::plugins::TextSearch;
+import lang::php::experiments::plugins::Includes;
 
 import Set;
 import Relation;
@@ -1749,4 +1750,18 @@ public void quickResolvePlugin(str pluginName) {
 	} else {
 		println("Could not use plugin info for plugin <pluginName>");
 	}
+}
+
+@doc{Extract inclusion guard information for all pre-parsed plugin binaries}
+public void extractIncludeGuards(bool overwrite = true) {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l), l.file > "wp-bible-embed" ]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
+    	if ( (overwrite && exists(pluginIncludesBin+"<l.file>-include-guards.bin")) || !exists(pluginIncludesBin+"<l.file>-include-guards.bin")) { 
+	        println("Extracting include guard info for plugin: <l.file>");
+	        igrel = includeGuards(loadPluginBinary(l.file));
+	        writeBinaryValueFile(pluginIncludesBin+"<l.file>-include-guards.bin", igrel);
+		} else {
+			println("Already extracted info for plugin: <l.file>");
+		}
+    }
 }
