@@ -153,7 +153,7 @@ public void extractPluginSummary(str pluginName) {
 @doc{Extract plugin summaries for all pre-parsed plugin binaries}
 public void extractPluginSummary(bool overwrite = true) {
     pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l) ]);
-    for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file)), l.file >= "gravity-forms-advanced-file-uploader") {
     	if ( (overwrite && exists(pluginInfoBin+"<l.file>-info.bin")) || !exists(pluginInfoBin+"<l.file>-info.bin")) { 
 	        println("Extracting info for plugin: <l.file>");
 	        extractPluginSummary(l.file);
@@ -1713,6 +1713,11 @@ public System relocateFiles(System sys, loc newBase) {
 	return patched;
 }
 
+public System installPlugin(System wp, System plugin) {
+	patched = relocateFiles(plugin, wp.baseLoc + "wp-content/plugins/<plugin.name>/");
+	return wp[files=wp.files + patched.files];
+}
+
 public void quickResolvePlugin(str pluginName) {
 	sys = loadPluginBinary(pluginName);
 	psum = loadPluginSummary(pluginName);
@@ -1721,8 +1726,7 @@ public void quickResolvePlugin(str pluginName) {
 		if (binaryExists("WordPress",maxVersion)) {
 			// Now, "install" the plugin into WordPress (at least logically)
 			wpsys = loadBinary("WordPress", maxVersion);
-			patched = relocateFiles(sys, wpsys.baseLoc + "wp-content/plugins/<sys.name>/");
-			wpsysExtended = wpsys[files=wpsys.files + patched.files];
+			wpsysExtended = installPlugin(wpsys, sys);
 			
 			buildIncludesInfo(wpsysExtended, overrideName=sys.name);
 			iinfo = loadIncludesInfo(sys.name);
@@ -1752,9 +1756,29 @@ public void quickResolvePlugin(str pluginName) {
 	}
 }
 
+public System loadInstalledPlugin(str pluginName) {
+	sys = loadPluginBinary(pluginName);
+	psum = loadPluginSummary(pluginName);
+	
+	if (psum.pInfo is pluginInfo && just(maxVersion) := psum.pInfo.testedUpTo && binaryExists("WordPress",maxVersion)) {
+		// Now, "install" the plugin into WordPress (at least logically)
+		wpsys = loadBinary("WordPress", maxVersion);
+		wpsysExtended = installPlugin(wpsys, sys);
+		return wpsysExtended;
+	}
+	
+	throw "Cannot load installed version of <pluginName>";
+}
+
+public QRRel loadResolvedPluginIncludes(str pluginName) {
+	return readBinaryValueFile(#rel[loc file, loc source, loc target], infoLoc + "<pluginName>-qr.bin");
+}
+
+public bool quickResolveComputed(str pluginName) = exists(infoLoc + "<pluginName>-qr.bin");
+
 @doc{Extract inclusion guard information for all pre-parsed plugin binaries}
 public void extractIncludeGuards(bool overwrite = true) {
-    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l), l.file > "wp-bible-embed" ]);
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l), l.file != "wp-bible-embed" ]);
     for (l <- pluginDirs, exists(getPluginBinLoc(l.file))) {
     	if ( (overwrite && exists(pluginIncludesBin+"<l.file>-include-guards.bin")) || !exists(pluginIncludesBin+"<l.file>-include-guards.bin")) { 
 	        println("Extracting include guard info for plugin: <l.file>");
@@ -1764,4 +1788,58 @@ public void extractIncludeGuards(bool overwrite = true) {
 			println("Already extracted info for plugin: <l.file>");
 		}
     }
+}
+
+public bool includeGuardsExtracted(str pluginName) = exists(pluginIncludesBin+"<pluginName>-include-guards.bin");
+
+public IRel loadIncludeGuards(str pluginName) {
+	return readBinaryValueFile(#IRel, pluginIncludesBin+"<pluginName>-include-guards.bin");
+}
+
+public GuardedQRRel buildGuardedIncludesRel(str pluginName) {
+	return buildGuardedIncludesRel(loadResolvedPluginIncludes(pluginName),loadIncludeGuards(pluginName));
+}
+
+public void buildGuardedIncludesRels(bool overwrite = true) {
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l)]);
+    for (l <- pluginDirs, exists(getPluginBinLoc(l.file)), quickResolveComputed(l.file), includeGuardsExtracted(l.file)) {
+    	if ( (overwrite && exists(pluginIncludesBin+"<l.file>-guarded-qr.bin")) || !exists(pluginIncludesBin+"<l.file>-guarded-qr.bin")) { 
+	        println("Building guarded includes relation for plugin: <l.file>");
+	        gir = buildGuardedIncludesRel(l.file);
+	        writeBinaryValueFile(pluginIncludesBin+"<l.file>-guarded-qr.bin", gir);
+		} else {
+			println("Already built relation for plugin: <l.file>");
+		}
+    }
+}
+
+public GuardedQRRel findGuardedIncludes() {
+	GuardedQRRel res = { };
+    pluginDirs = sort([l | l <- pluginDir.ls, isDirectory(l)]);
+    for (l <- pluginDirs, exists(pluginIncludesBin+"<l.file>-guarded-qr.bin")) {
+    	gir = readBinaryValueFile(#GuardedQRRel, pluginIncludesBin+"<l.file>-guarded-qr.bin");
+    	res = res + { < f, s, t, g > | < f, s, t, g > <- gir, notGuarded() !:= g };
+    }
+	return res;
+}
+
+public GuardedQRRel findGuardedIncludesByFunctionName(set[str] fnames, GuardedQRRel grel) {
+	return { < f, s, t, g > | 
+		< f, s, t, g > <- grel, 
+		guardedBy(el) := g, 
+		[_*,unaryOperation(call(name(name(cn)),_),booleanNot()),_*] := el,
+		cn in fnames
+		};
+}
+
+public map[str,int] constantDistribution(GuardedQRRel grel) {
+	map[str,int] res = ( );
+	for (/call(name(name("defined")),[actualParameter(scalar(string(cn)),_)]) := grel) {
+		if (cn in res) {
+			res[cn] = res[cn] + 1;
+		} else {
+			res[cn] = 1;
+		}
+	}
+	return res;
 }
