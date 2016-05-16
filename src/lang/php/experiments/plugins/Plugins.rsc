@@ -627,10 +627,10 @@ public data NamePart = literalPart(str s) | exprPart(Expr e);
 public alias NameModel = list[NamePart];
 
 public Expr replaceClassConsts(Expr e, loc el, PluginSummary psum) {
-	containerClasses = { cname | < cname, at > <- psum.classes, insideLoc(el,at) };
+	containerClasses = { cname | < cname, at, _ > <- psum.classes, insideLoc(el,at) };
 	if (size(containerClasses) == 1) {
 		cname = getOneFrom(containerClasses);
-		possibleClassConsts = { < xname,  d > | < cname, xname, at, d > <- psum.classConsts };
+		possibleClassConsts = { < xname,  d > | < cname, xname, at, d, _ > <- psum.classConsts };
 		e = bottom-up visit(e) {
 			case fcc:fetchClassConst(name(name("self")),cn) : {
 				possibleMatches = possibleClassConsts[cn];
@@ -1191,7 +1191,7 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 			// These are the cases for where the call target is given as a string.
 			if (fn in psum.functions<0> || fn in wpsum.functions<0>) {
 				// In this case, the target is an actual function provided by the plugin or by WordPress
-				res = res + { < usedAt, use, defAt, def, reg, 99, functionTarget(pluginName,fn,at) > | < fn,at> <- (psum.functions + wpsum.functions) };
+				res = res + { < usedAt, use, defAt, def, reg, 99, functionTarget(pluginName,fn,at) > | < fn,at,_> <- (psum.functions + wpsum.functions) };
 			} else if (contains(fn,"::")) {
 				// Here the target is a static method on a class, given as ClassName::MethodName
 				pieces = split("::",fn);
@@ -1199,7 +1199,7 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 				classPieces = split("\\",intercalate("::",pieces[..-1]));
 				className = classPieces[-1];
 
-				possibleMethods = { < className, methodName, at > | < className, methodName, at, _ > <- (psum.methods + wpsum.methods) };
+				possibleMethods = { < className, methodName, at > | < className, methodName, at, _, _> <- (psum.methods + wpsum.methods) };
 
 				if (size(possibleMethods) > 0) {
 					res = res + { < usedAt, use, defAt, def, reg, 99, staticMethodTarget(pluginName,className, methodName, at) > | < className, methodName, at > <- possibleMethods };
@@ -1211,7 +1211,7 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 				functionPieces = split("\\", fn);
 				functionName = functionPieces[-1];
 				if (functionName in psum.functions<0> || functionName in wpsum.functions<0>) {
-					res = res + { < usedAt, use, defAt, def, reg, 99, functionTarget(pluginName,functionName,at) > | < functionName,at> <- (psum.functions + wpsum.functions) };
+					res = res + { < usedAt, use, defAt, def, reg, 99, functionTarget(pluginName,functionName,at) > | < functionName,at,_> <- (psum.functions + wpsum.functions) };
 				} else {
 					res = res + < usedAt, use, defAt, def, reg, 0, unknownFunctionTarget(fn) >;
 				}			
@@ -1221,8 +1221,8 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 			}
 		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,var(name(name("this"))),_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
 			// This is a method call on $this, with the method name given as a string literal
-			containerClasses = { cname | < cname, at > <- (wpsum.classes + psum.classes), insideLoc(defAt,at) || insideLoc(usedAt,at) };
-			possibleMethods = { < cname, mn, at > | cname <- containerClasses, < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			containerClasses = { cname | < cname, at, _ > <- (wpsum.classes + psum.classes), insideLoc(defAt,at) || insideLoc(usedAt,at) };
+			possibleMethods = { < cname, mn, at > | cname <- containerClasses, < cname, mn, at, _, _ > <- (psum.methods + wpsum.methods) };
 			if (size(possibleMethods) > 0) {
 				res = res + { < usedAt, use, defAt, def, reg, 99, methodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods };
 			} else {
@@ -1230,10 +1230,10 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 			}
 		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,var(name(name("this"))),_),arrayElement(_,e,_)]),_),_*]) := reg) {
 			// This is a method call on $this, with the method name given as an expression
-			containerClasses = { cname | < cname, at > <- (wpsum.classes + psum.classes), insideLoc(defAt,at) || insideLoc(usedAt,at) };
+			containerClasses = { cname | < cname, at, _ > <- (wpsum.classes + psum.classes), insideLoc(defAt,at) || insideLoc(usedAt,at) };
 			methodNameModel = nameModel(e,psum);
 			methodRegexp = regexpForNameModel(methodNameModel);
-			possibleMethods = { < cname, mn, at > | cname <- containerClasses, < cname, mn, at, _ > <- (psum.methods + wpsum.methods), rexpMatch(mn, methodRegexp) };
+			possibleMethods = { < cname, mn, at > | cname <- containerClasses, < cname, mn, at, _, _ > <- (psum.methods + wpsum.methods), rexpMatch(mn, methodRegexp) };
 			if (size(possibleMethods) > 0) {
 				res = res + { < usedAt, use, defAt, def, reg, specificity(methodNameModel, "somename"), methodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods };
 			} else {
@@ -1241,7 +1241,7 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 			}
 		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,scalar(string(cn)),_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
 			// This is a static method call, given instead as array elements, e.g., array("ClassName","MethodName")
-			possibleMethods = { < cn, mn, at > | < cn, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			possibleMethods = { < cn, mn, at > | < cn, mn, at, _, _ > <- (psum.methods + wpsum.methods) };
 			if (size(possibleMethods) > 0) {
 				res = res + { < usedAt, use, defAt, def, reg, 99, staticMethodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods };
 			} else {
@@ -1249,7 +1249,7 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 			}
 		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,scalar(string(cn)),_),arrayElement(_,e,_)]),_),_*]) := reg) {
 			// This is a static method call, given instead as array elements, but with the second element an expression
-			possibleMethods = { < cn, mn, at > | < cn, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			possibleMethods = { < cn, mn, at > | < cn, mn, at, _, _ > <- (psum.methods + wpsum.methods) };
 			methodNameModel = nameModel(e,psum);
 			methodRegexp = regexpForNameModel(methodNameModel);
 			if (size(possibleMethods) > 0) {
@@ -1259,7 +1259,7 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 			}
 		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,Expr e,_),arrayElement(_,scalar(string(mn)),_)]),_),_*]) := reg) {
 			// This is a method call on some expression, since we don't have types we do a probable match
-			possibleMethods = { < cname, mn, at > | < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			possibleMethods = { < cname, mn, at > | < cname, mn, at, _, _ > <- (psum.methods + wpsum.methods) };
 			if (size(possibleMethods) > 0) {
 				res = res + { < usedAt, use, defAt, def, reg, 99, potentialMethodTarget(pluginName, cname, mname, at) > | < cname, mname, at > <- possibleMethods };
 			} else {
@@ -1267,7 +1267,7 @@ public HookUsesResolved resolveCallbacks(str pluginName) {
 			}
 		} else if (h:call(name(name(_)),[actualParameter(_,_),actualParameter(array([arrayElement(_,Expr e,_),arrayElement(_,e,_)]),_),_*]) := reg) {
 			// This is a method call on some expression, since we don't have types we do a probable match
-			possibleMethods = { < cname, mn, at > | < cname, mn, at, _ > <- (psum.methods + wpsum.methods) };
+			possibleMethods = { < cname, mn, at > | < cname, mn, at, _, _ > <- (psum.methods + wpsum.methods) };
 			methodNameModel = nameModel(e,psum);
 			methodRegexp = regexpForNameModel(methodNameModel);
 			if (size(possibleMethods) > 0) {
